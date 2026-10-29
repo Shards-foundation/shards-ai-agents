@@ -2784,6 +2784,10 @@ def test_pressing_evaluate_on_an_untraced_run_counts_the_press_and_nothing_else(
     app._execution_uuid = "run-this-app"
     app._unsubscribe = lambda: None  # type: ignore[method-assign]
     app.exit = lambda result=None: None  # type: ignore[method-assign]
+    # The consent screen is pushed outside a running loop here. Textual then builds a
+    # bare asyncio.Future(), which raises when an earlier test (random order) has left
+    # no current event loop. The test is about the counting, not the screen.
+    app.push_screen = lambda *a, **k: None  # type: ignore[method-assign]
     monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: False)
 
     app.action_evaluate_crew()
