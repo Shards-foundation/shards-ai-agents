@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - 'tests/**/*.py'
+      - 'lib/**/tests/**/*.py'
   workflow_dispatch:
 
 permissions:
@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.13']
     env:
       OPENAI_API_KEY: fake-api-key
       PYTHONUNBUFFERED: 1

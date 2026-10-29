@@ -1,37 +1,35 @@
 name: Generate Tool Specifications
 
+# Verify-only: regenerates lib/shards-ai-agents-tools/tool.specs.json and fails if it is
+# out of date. (The upstream version pushed an auto-commit using a GitHub App; that needs
+# secrets this repo does not have.) To fix a failure, run
+#   cd lib/shards-ai-agents-tools && uv run python src/shards_ai_agents_tools/generate_tool_specs.py
+# and commit the result.
 on:
   pull_request:
     branches:
       - main
     paths:
       - 'lib/shards-ai-agents-tools/src/shards_ai_agents_tools/**'
+      - 'lib/shards-ai-agents-tools/tool.specs.json'
+      - '.github/workflows/generate-tool-specs.yml'
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   generate-specs:
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    name: Verify tool specs are up to date
     runs-on: ubuntu-latest
     env:
       PYTHONUNBUFFERED: 1
 
     steps:
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ secrets.SHARDS_AI_AGENTS_TOOL_SPECS_APP_ID }}
-          private-key: ${{ secrets.SHARDS_AI_AGENTS_TOOL_SPECS_PRIVATE_KEY }}
-
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ github.head_ref }}
-          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
@@ -48,17 +46,12 @@ jobs:
         working-directory: lib/shards-ai-agents-tools
         run: uv run python src/shards_ai_agents_tools/generate_tool_specs.py
 
-      - name: Check for changes and commit
+      - name: Verify tool.specs.json is up to date
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add lib/shards-ai-agents-tools/tool.specs.json
-
-          if git diff --quiet --staged; then
-            echo "No changes detected in tool.specs.json"
+          if git diff --quiet -- lib/shards-ai-agents-tools/tool.specs.json; then
+            echo "tool.specs.json is up to date"
           else
-            echo "Changes detected in tool.specs.json, committing..."
-            git commit -m "chore: update tool specifications"
-            git push
+            echo "::error::tool.specs.json is out of date. Regenerate it and commit the result."
+            git diff --stat -- lib/shards-ai-agents-tools/tool.specs.json
+            exit 1
           fi

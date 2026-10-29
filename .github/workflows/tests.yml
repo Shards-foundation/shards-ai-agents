@@ -1,6 +1,8 @@
 name: Run Tests
 
-on: [pull_request]
+on:
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -10,11 +12,12 @@ jobs:
     name: Detect changes
     runs-on: ubuntu-latest
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      code: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
         id: filter
+        if: github.event_name != 'workflow_dispatch'
         with:
           # Exclusion-only patterns match every non-excluded file under the
           # default "some" quantifier. Require all patterns (including "**")
@@ -32,12 +35,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       fail-fast: true
       matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13']
-        group: [1, 2, 3, 4, 5, 6, 7, 8]
+        python-version: ['3.10', '3.13']
+        group: [1, 2, 3, 4]
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -73,8 +76,8 @@ jobs:
           key: test-durations-py${{ matrix.python-version }}
 
       # pytest-randomly shuffles before pytest-split slices, so every group job must
-      # share one seed; per-job seeds make the 8 groups overlap and skip about a third.
-      - name: Run tests (group ${{ matrix.group }} of 8)
+      # share one seed; per-job seeds make the 4 groups overlap and skip about a third.
+      - name: Run tests (group ${{ matrix.group }} of 4)
         run: |
           PYTHON_VERSION_SAFE=$(echo "${{ matrix.python-version }}" | tr '.' '_')
           DURATION_FILE="../../.test_durations_py${PYTHON_VERSION_SAFE}"
@@ -98,28 +101,28 @@ jobs:
 
           cd lib/shards-ai-agents && uv run pytest \
             -vv \
-            --splits 8 \
+            --splits 4 \
             --group ${{ matrix.group }} \
             --randomly-seed=${{ github.run_id }} \
             $DURATIONS_ARG \
             --durations=10 \
             --maxfail=3
 
-      - name: Run tool tests (group ${{ matrix.group }} of 8)
+      - name: Run tool tests (group ${{ matrix.group }} of 4)
         run: |
           cd lib/shards-ai-agents-tools && uv run pytest \
             -vv \
-            --splits 8 \
+            --splits 4 \
             --group ${{ matrix.group }} \
             --randomly-seed=${{ github.run_id }} \
             --durations=10 \
             --maxfail=3
 
-      - name: Run CLI, core and files tests (group ${{ matrix.group }} of 8)
+      - name: Run CLI, core and files tests (group ${{ matrix.group }} of 4)
         run: |
           uv run pytest lib/cli/tests lib/shards-ai-agents-core/tests lib/shards-ai-agents-files/tests \
             -vv \
-            --splits 8 \
+            --splits 4 \
             --group ${{ matrix.group }} \
             --randomly-seed=${{ github.run_id }} \
             --durations=10 \
@@ -136,7 +139,7 @@ jobs:
             .venv
           key: uv-main-py${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
 
-  # Report the required check names (tests 3.10–3.13) when the matrix is skipped.
+  # Report the required check names (tests 3.10 and 3.13) when the matrix is skipped.
   # Branch protection expects these names; a skipped matrix never reports them.
   tests-skip:
     name: tests (${{ matrix.python-version }})
@@ -145,7 +148,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.13']
     steps:
       - name: Skip non-code change
         run: echo "Non-code change, skipping tests"

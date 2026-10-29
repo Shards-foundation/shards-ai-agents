@@ -24,6 +24,9 @@ on:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
+    # Code scanning on private repos needs GitHub Advanced Security. Run on public repos,
+    # or set the repository variable CODEQL_ENABLED=true once GHAS is enabled.
+    if: ${{ !github.event.repository.private || vars.CODEQL_ENABLED == 'true' }}
     # Runner size impacts CodeQL analysis time. To learn more, please see:
     #   - https://gh.io/recommended-hardware-resources-for-running-codeql
     #   - https://gh.io/supported-runners-and-hardware-resources
