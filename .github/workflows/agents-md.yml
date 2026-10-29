@@ -3,7 +3,7 @@ name: AGENTS.md
 # The AGENTS.md that `shards-agents create` ships is tested in lib/cli/tests. The main test
 # workflow skips PRs that change only .md files, docs, or workflows, and never runs
 # lib/devtools/tests, so these guards run whenever the file, its tests, the eval, or the
-# docs pages it links change. The eval itself is agents-md-eval.yml.
+# docs pages it links change. The eval itself is parked in .github/workflows-disabled/agents-md-eval.yml (needs LLM API keys).
 on:
   pull_request:
     branches: [main]
@@ -17,7 +17,7 @@ on:
       - "docs/docs.json"
       - "docs/edge/en/**"
       - ".github/workflows/agents-md.yml"
-      - ".github/workflows/agents-md-eval.yml"
+      - ".github/workflows-disabled/agents-md-eval.yml"
 
 permissions:
   contents: read

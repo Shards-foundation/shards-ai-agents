@@ -11795,11 +11795,6 @@
           }
         },
         "properties": {
-          "shards_ai_agents_enterprise_url": {
-            "description": "The base URL of Shards-ai-agents AMP. If not provided, it will be loaded from the environment variable SHARDS_AI_AGENTS_PLUS_URL with default https://app.shards-ai-agents.invalid.",
-            "title": "Shards-ai-agents Enterprise Url",
-            "type": "string"
-          },
           "personal_access_token": {
             "anyOf": [
               {
@@ -11811,6 +11806,11 @@
             ],
             "description": "The user's Personal Access Token to access Shards-ai-agents AMP API. If not provided, it will be loaded from the environment variable SHARDS_AI_AGENTS_PERSONAL_ACCESS_TOKEN.",
             "title": "Personal Access Token"
+          },
+          "shards_ai_agents_enterprise_url": {
+            "description": "The base URL of Shards-ai-agents AMP. If not provided, it will be loaded from the environment variable SHARDS_AI_AGENTS_PLUS_URL with default https://app.shards-ai-agents.invalid.",
+            "title": "Shards Ai Agents Enterprise Url",
+            "type": "string"
           }
         },
         "required": [],

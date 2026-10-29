@@ -26,7 +26,7 @@ jobs:
           files_to_ignore: |
             uv.lock
             *.lock
-            lib/shards-ai-agents/src/shards_ai_agents/cli/templates/**
+            lib/cli/src/shards_ai_agents_cli/templates/**
             **/*.json
             **/test_durations/**
             **/cassettes/**
