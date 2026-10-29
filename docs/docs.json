@@ -1,0 +1,1726 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "aspen",
+  "name": "Shards-ai-agents",
+  "colors": {
+    "primary": "#EB6658",
+    "light": "#F3A78B",
+    "dark": "#C94C3C"
+  },
+  "favicon": "/images/favicon.svg",
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "mcp",
+      "cursor",
+      "vscode",
+      {
+        "title": "Request a feature",
+        "description": "Join the discussion on GitHub to request a new feature",
+        "icon": "plus",
+        "href": "https://github.com/Shards-foundation/shards-ai-agents/issues/new/choose"
+      }
+    ]
+  },
+  "navigation": {
+    "languages": [
+      {
+        "language": "en",
+        "global": {
+          "anchors": []
+        },
+        "versions": [
+          {
+            "version": "Edge",
+            "tabs": [
+              {
+                "tab": "Home",
+                "icon": "house",
+                "groups": [
+                  {
+                    "group": "Welcome",
+                    "pages": [
+                      "index"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "Documentation",
+                "icon": "book-open",
+                "groups": [
+                  {
+                    "group": "Get Started",
+                    "pages": [
+                      "edge/en/introduction",
+                      "edge/en/guides/coding-tools/build-with-ai",
+                      "edge/en/skills",
+                      "edge/en/installation",
+                      "edge/en/quickstart"
+                    ]
+                  },
+                  {
+                    "group": "Guides",
+                    "pages": [
+                      {
+                        "group": "Strategy",
+                        "icon": "compass",
+                        "pages": [
+                          "edge/en/guides/concepts/evaluating-use-cases"
+                        ]
+                      },
+                      {
+                        "group": "Agents",
+                        "icon": "user",
+                        "pages": [
+                          "edge/en/guides/agents/crafting-effective-agents"
+                        ]
+                      },
+                      {
+                        "group": "Crews",
+                        "icon": "users",
+                        "pages": [
+                          "edge/en/guides/crews/first-crew"
+                        ]
+                      },
+                      {
+                        "group": "Flows",
+                        "icon": "code-branch",
+                        "pages": [
+                          "edge/en/guides/flows/first-flow",
+                          "edge/en/guides/flows/mastering-flow-state",
+                          "edge/en/guides/flows/conversational-flows",
+                          "edge/en/guides/flows/inputs-id-deprecation"
+                        ]
+                      },
+                      {
+                        "group": "Frontend",
+                        "icon": "browser",
+                        "pages": [
+                          "edge/en/guides/frontend/overview",
+                          "edge/en/guides/frontend/conversational-flows",
+                          "edge/en/guides/frontend/generative-ui",
+                          "edge/en/guides/frontend/tool-based-generative-ui",
+                          "edge/en/guides/frontend/agentic-generative-ui",
+                          "edge/en/guides/frontend/reasoning",
+                          "edge/en/guides/frontend/a2ui",
+                          "edge/en/guides/frontend/human-in-the-loop",
+                          "edge/en/guides/frontend/shared-state",
+                          "edge/en/guides/frontend/frontend-actions",
+                          "edge/en/guides/frontend/predictive-state-updates",
+                          "edge/en/guides/frontend/channels"
+                        ]
+                      },
+                      {
+                        "group": "Tools",
+                        "icon": "wrench",
+                        "pages": [
+                          "edge/en/guides/tools/publish-custom-tools"
+                        ]
+                      },
+                      {
+                        "group": "Coding Tools",
+                        "icon": "terminal",
+                        "pages": [
+                          "edge/en/guides/coding-tools/agents-md",
+                          "edge/en/guides/coding-tools/build-with-ai"
+                        ]
+                      },
+                      {
+                        "group": "Advanced",
+                        "icon": "gear",
+                        "pages": [
+                          "edge/en/guides/advanced/customizing-prompts",
+                          "edge/en/guides/advanced/fingerprinting"
+                        ]
+                      },
+                      {
+                        "group": "Migration",
+                        "icon": "shuffle",
+                        "pages": [
+                          "edge/en/guides/migration/migrating-from-langgraph",
+                          "edge/en/guides/migration/upgrading-shards-ai-agents"
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "group": "Core Concepts",
+                    "pages": [
+                      "edge/en/concepts/agents",
+                      "edge/en/concepts/agent-capabilities",
+                      "edge/en/concepts/tasks",
+                      "edge/en/concepts/crews",
+                      "edge/en/concepts/flows",
+                      "edge/en/concepts/streaming",
+                      "edge/en/concepts/production-architecture",
+                      "edge/en/concepts/knowledge",
+                      "edge/en/concepts/skills",
+                      "edge/en/concepts/llms",
+                      "edge/en/concepts/files",
+                      "edge/en/concepts/processes",
+                      "edge/en/concepts/collaboration",
+                      "edge/en/concepts/training",
+                      "edge/en/concepts/memory",
+                      "edge/en/concepts/reasoning",
+                      "edge/en/concepts/planning",
+                      "edge/en/concepts/testing",
+                      "edge/en/concepts/cli",
+                      "edge/en/concepts/tools",
+                      "edge/en/concepts/event-listener",
+                      "edge/en/concepts/checkpointing"
+                    ]
+                  },
+                  {
+                    "group": "MCP Integration",
+                    "pages": [
+                      "edge/en/mcp/overview",
+                      "edge/en/mcp/dsl-integration",
+                      "edge/en/mcp/stdio",
+                      "edge/en/mcp/sse",
+                      "edge/en/mcp/streamable-http",
+                      "edge/en/mcp/multiple-servers",
+                      "edge/en/mcp/security"
+                    ]
+                  },
+                  {
+                    "group": "Tools",
+                    "pages": [
+                      "edge/en/tools/overview",
+                      {
+                        "group": "File & Document",
+                        "icon": "folder-open",
+                        "pages": [
+                          "edge/en/tools/file-document/overview",
+                          "edge/en/tools/file-document/filereadtool",
+                          "edge/en/tools/file-document/filewritetool",
+                          "edge/en/tools/file-document/pdfsearchtool",
+                          "edge/en/tools/file-document/docxsearchtool",
+                          "edge/en/tools/file-document/mdxsearchtool",
+                          "edge/en/tools/file-document/xmlsearchtool",
+                          "edge/en/tools/file-document/txtsearchtool",
+                          "edge/en/tools/file-document/jsonsearchtool",
+                          "edge/en/tools/file-document/csvsearchtool",
+                          "edge/en/tools/file-document/directorysearchtool",
+                          "edge/en/tools/file-document/directoryreadtool",
+                          "edge/en/tools/file-document/ocrtool",
+                          "edge/en/tools/file-document/pdf-text-writing-tool"
+                        ]
+                      },
+                      {
+                        "group": "Web Scraping & Browsing",
+                        "icon": "globe",
+                        "pages": [
+                          "edge/en/tools/web-scraping/overview",
+                          "edge/en/tools/web-scraping/scrapewebsitetool",
+                          "edge/en/tools/web-scraping/scrapeelementfromwebsitetool",
+                          "edge/en/tools/web-scraping/scrapflyscrapetool",
+                          "edge/en/tools/web-scraping/seleniumscrapingtool",
+                          "edge/en/tools/web-scraping/scrapegraphscrapetool",
+                          "edge/en/tools/web-scraping/spidertool",
+                          "edge/en/tools/web-scraping/browserbaseloadtool",
+                          "edge/en/tools/web-scraping/hyperbrowserloadtool",
+                          "edge/en/tools/web-scraping/stagehandtool",
+                          "edge/en/tools/web-scraping/firecrawlcrawlwebsitetool",
+                          "edge/en/tools/web-scraping/firecrawlscrapewebsitetool",
+                          "edge/en/tools/web-scraping/oxylabsscraperstool",
+                          "edge/en/tools/web-scraping/brightdata-tools",
+                          "edge/en/tools/web-scraping/youai-contents"
+                        ]
+                      },
+                      {
+                        "group": "Search & Research",
+                        "icon": "magnifying-glass",
+                        "pages": [
+                          "edge/en/tools/search-research/overview",
+                          "edge/en/tools/search-research/serperdevtool",
+                          "edge/en/tools/search-research/bravesearchtool",
+                          "edge/en/tools/search-research/exasearchtool",
+                          "edge/en/tools/search-research/linkupsearchtool",
+                          "edge/en/tools/search-research/githubsearchtool",
+                          "edge/en/tools/search-research/websitesearchtool",
+                          "edge/en/tools/search-research/codedocssearchtool",
+                          "edge/en/tools/search-research/youtubechannelsearchtool",
+                          "edge/en/tools/search-research/youtubevideosearchtool",
+                          "edge/en/tools/search-research/tavilysearchtool",
+                          "edge/en/tools/search-research/tavilyextractortool",
+                          "edge/en/tools/search-research/tavilyresearchtool",
+                          "edge/en/tools/search-research/arxivpapertool",
+                          "edge/en/tools/search-research/serpapi-googlesearchtool",
+                          "edge/en/tools/search-research/serpapi-googleshoppingtool",
+                          "edge/en/tools/search-research/databricks-query-tool",
+                          "edge/en/tools/search-research/youai-search"
+                        ]
+                      },
+                      {
+                        "group": "Database & Data",
+                        "icon": "database",
+                        "pages": [
+                          "edge/en/tools/database-data/overview",
+                          "edge/en/tools/database-data/mysqltool",
+                          "edge/en/tools/database-data/pgsearchtool",
+                          "edge/en/tools/database-data/snowflakesearchtool",
+                          "edge/en/tools/database-data/nl2sqltool",
+                          "edge/en/tools/database-data/qdrantvectorsearchtool",
+                          "edge/en/tools/database-data/weaviatevectorsearchtool",
+                          "edge/en/tools/database-data/mongodbvectorsearchtool",
+                          "edge/en/tools/database-data/singlestoresearchtool",
+                          "edge/en/tools/database-data/db2searchtool"
+                        ]
+                      },
+                      {
+                        "group": "AI & Machine Learning",
+                        "icon": "brain",
+                        "pages": [
+                          "edge/en/tools/ai-ml/overview",
+                          "edge/en/tools/ai-ml/dalletool",
+                          "edge/en/tools/ai-ml/visiontool",
+                          "edge/en/tools/ai-ml/aimindtool",
+                          "edge/en/tools/ai-ml/llamaindextool",
+                          "edge/en/tools/ai-ml/langchaintool",
+                          "edge/en/tools/ai-ml/ragtool",
+                          "edge/en/tools/ai-ml/codeinterpretertool",
+                          "edge/en/tools/ai-ml/daytona",
+                          "edge/en/tools/ai-ml/e2bsandboxtools"
+                        ]
+                      },
+                      {
+                        "group": "Cloud & Storage",
+                        "icon": "cloud",
+                        "pages": [
+                          "edge/en/tools/cloud-storage/overview",
+                          "edge/en/tools/cloud-storage/s3readertool",
+                          "edge/en/tools/cloud-storage/s3writertool",
+                          "edge/en/tools/cloud-storage/bedrockkbretriever"
+                        ]
+                      },
+                      {
+                        "group": "Integrations",
+                        "icon": "plug",
+                        "pages": [
+                          "edge/en/tools/integration/overview",
+                          "edge/en/tools/integration/bedrockinvokeagenttool",
+                          "edge/en/tools/integration/shardsagentsautomationtool",
+                          "edge/en/tools/integration/mergeagenthandlertool"
+                        ]
+                      },
+                      {
+                        "group": "Automation",
+                        "icon": "bolt",
+                        "pages": [
+                          "edge/en/tools/automation/overview",
+                          "edge/en/tools/automation/apifyactorstool",
+                          "edge/en/tools/automation/composiotool",
+                          "edge/en/tools/automation/multiontool",
+                          "edge/en/tools/automation/waittool",
+                          "edge/en/tools/automation/zapieractionstool"
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "group": "Observability",
+                    "pages": [
+                      "edge/en/observability/tracing",
+                      "edge/en/observability/overview",
+                      "edge/en/observability/arize-phoenix",
+                      "edge/en/observability/braintrust",
+                      "edge/en/observability/datadog",
+                      "edge/en/observability/galileo",
+                      "edge/en/observability/langdb",
+                      "edge/en/observability/langfuse",
+                      "edge/en/observability/langtrace",
+                      "edge/en/observability/maxim",
+                      "edge/en/observability/mlflow",
+                      "edge/en/observability/neatlogs",
+                      "edge/en/observability/openlit",
+                      "edge/en/observability/opik",
+                      "edge/en/observability/patronus-evaluation",
+                      "edge/en/observability/portkey",
+                      "edge/en/observability/weave",
+                      "edge/en/observability/truefoundry"
+                    ]
+                  },
+                  {
+                    "group": "Learn",
+                    "pages": [
+                      "edge/en/learn/overview",
+                      "edge/en/learn/llm-selection-guide",
+                      "edge/en/learn/conditional-tasks",
+                      "edge/en/learn/coding-agents",
+                      "edge/en/learn/create-custom-tools",
+                      "edge/en/learn/custom-llm",
+                      "edge/en/learn/custom-manager-agent",
+                      "edge/en/learn/customizing-agents",
+                      "edge/en/learn/dalle-image-generation",
+                      "edge/en/learn/force-tool-output-as-result",
+                      "edge/en/learn/hierarchical-process",
+                      "edge/en/learn/human-input-on-execution",
+                      "edge/en/learn/human-in-the-loop",
+                      "edge/en/learn/human-feedback-in-flows",
+                      "edge/en/learn/kickoff-async",
+                      "edge/en/learn/kickoff-for-each",
+                      "edge/en/learn/streaming-runtime-contract",
+                      "edge/en/learn/consuming-streams",
+                      "edge/en/learn/llm-connections",
+                      "edge/en/learn/litellm-removal-guide",
+                      "edge/en/learn/multimodal-agents",
+                      "edge/en/learn/replay-tasks-from-latest-crew-kickoff",
+                      "edge/en/learn/sequential-process",
+                      "edge/en/learn/using-annotations",
+                      {
+                        "group": "Execution Hooks",
+                        "pages": [
+                          "edge/en/learn/execution-hooks",
+                          "edge/en/learn/llm-hooks",
+                          "edge/en/learn/tool-hooks",
+                          "edge/en/learn/execution-boundary-hooks",
+                          "edge/en/learn/step-hooks",
+                          "edge/en/learn/before-and-after-kickoff-hooks"
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "group": "Telemetry",
+                    "pages": [
+                      "edge/en/telemetry"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "API Reference",
+                "icon": "magnifying-glass",
+                "groups": [
+                  {
+                    "group": "Getting Started",
+                    "pages": [
+                      "edge/en/api-reference/introduction",
+                      "edge/en/api-reference/inputs",
+                      "edge/en/api-reference/kickoff",
+                      "edge/en/api-reference/resume",
+                      "edge/en/api-reference/status"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "Examples",
+                "icon": "code",
+                "groups": [
+                  {
+                    "group": "Examples",
+                    "pages": [
+                      "edge/en/examples/example",
+                      "edge/en/examples/cookbooks"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "Changelog",
+                "icon": "clock",
+                "groups": [
+                  {
+                    "group": "Release Notes",
+                    "pages": [
+                      "edge/en/changelog"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "default": true
+          }
+        ]
+      },
+      {
+        "language": "pt-BR",
+        "global": {
+          "anchors": []
+        },
+        "versions": [
+          {
+            "version": "Edge",
+            "tabs": [
+              {
+                "tab": "Início",
+                "icon": "house",
+                "groups": [
+                  {
+                    "group": "Bem-vindo",
+                    "pages": [
+                      "edge/pt-BR/index"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "Documentação",
+                "icon": "book-open",
+                "groups": [
+                  {
+                    "group": "Começando",
+                    "pages": [
+                      "edge/pt-BR/introduction",
+                      "edge/pt-BR/guides/coding-tools/build-with-ai",
+                      "edge/pt-BR/skills",
+                      "edge/pt-BR/installation",
+                      "edge/pt-BR/quickstart"
+                    ]
+                  },
+                  {
+                    "group": "Guias",
+                    "pages": [
+                      {
+                        "group": "Estratégia",
+                        "icon": "compass",
+                        "pages": [
+                          "edge/pt-BR/guides/concepts/evaluating-use-cases"
+                        ]
+                      },
+                      {
+                        "group": "Agentes",
+                        "icon": "user",
+                        "pages": [
+                          "edge/pt-BR/guides/agents/crafting-effective-agents"
+                        ]
+                      },
+                      {
+                        "group": "Crews",
+                        "icon": "users",
+                        "pages": [
+                          "edge/pt-BR/guides/crews/first-crew"
+                        ]
+                      },
+                      {
+                        "group": "Flows",
+                        "icon": "code-branch",
+                        "pages": [
+                          "edge/pt-BR/guides/flows/first-flow",
+                          "edge/pt-BR/guides/flows/mastering-flow-state",
+                          "edge/pt-BR/guides/flows/conversational-flows",
+                          "edge/pt-BR/guides/flows/inputs-id-deprecation"
+                        ]
+                      },
+                      {
+                        "group": "Frontend",
+                        "icon": "browser",
+                        "pages": [
+                          "edge/pt-BR/guides/frontend/overview",
+                          "edge/pt-BR/guides/frontend/channels"
+                        ]
+                      },
+                      {
+                        "group": "Ferramentas",
+                        "icon": "wrench",
+                        "pages": [
+                          "edge/pt-BR/guides/tools/publish-custom-tools"
+                        ]
+                      },
+                      {
+                        "group": "Ferramentas de Codificação",
+                        "icon": "terminal",
+                        "pages": [
+                          "edge/pt-BR/guides/coding-tools/agents-md"
+                        ]
+                      },
+                      {
+                        "group": "Avançado",
+                        "icon": "gear",
+                        "pages": [
+                          "edge/pt-BR/guides/advanced/customizing-prompts",
+                          "edge/pt-BR/guides/advanced/fingerprinting"
+                        ]
+                      },
+                      {
+                        "group": "Migração",
+                        "icon": "shuffle",
+                        "pages": [
+                          "edge/pt-BR/guides/migration/migrating-from-langgraph"
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "group": "Conceitos-Chave",
+                    "pages": [
+                      "edge/pt-BR/concepts/agents",
+                      "edge/pt-BR/concepts/agent-capabilities",
+                      "edge/pt-BR/concepts/tasks",
+                      "edge/pt-BR/concepts/crews",
+                      "edge/pt-BR/concepts/flows",
+                      "edge/pt-BR/concepts/production-architecture",
+                      "edge/pt-BR/concepts/knowledge",
+                      "edge/pt-BR/concepts/skills",
+                      "edge/pt-BR/concepts/llms",
+                      "edge/pt-BR/concepts/files",
+                      "edge/pt-BR/concepts/processes",
+                      "edge/pt-BR/concepts/collaboration",
+                      "edge/pt-BR/concepts/training",
+                      "edge/pt-BR/concepts/memory",
+                      "edge/pt-BR/concepts/reasoning",
+                      "edge/pt-BR/concepts/planning",
+                      "edge/pt-BR/concepts/testing",
+                      "edge/pt-BR/concepts/cli",
+                      "edge/pt-BR/concepts/tools",
+                      "edge/pt-BR/concepts/event-listener",
+                      "edge/pt-BR/concepts/checkpointing"
+                    ]
+                  },
+                  {
+                    "group": "Integração MCP",
+                    "pages": [
+                      "edge/pt-BR/mcp/overview",
+                      "edge/pt-BR/mcp/dsl-integration",
+                      "edge/pt-BR/mcp/stdio",
+                      "edge/pt-BR/mcp/sse",
+                      "edge/pt-BR/mcp/streamable-http",
+                      "edge/pt-BR/mcp/multiple-servers",
+                      "edge/pt-BR/mcp/security"
+                    ]
+                  },
+                  {
+                    "group": "Ferramentas",
+                    "pages": [
+                      "edge/pt-BR/tools/overview",
+                      {
+                        "group": "Arquivo & Documento",
+                        "icon": "folder-open",
+                        "pages": [
+                          "edge/pt-BR/tools/file-document/overview",
+                          "edge/pt-BR/tools/file-document/filereadtool",
+                          "edge/pt-BR/tools/file-document/filewritetool",
+                          "edge/pt-BR/tools/file-document/pdfsearchtool",
+                          "edge/pt-BR/tools/file-document/docxsearchtool",
+                          "edge/pt-BR/tools/file-document/mdxsearchtool",
+                          "edge/pt-BR/tools/file-document/xmlsearchtool",
+                          "edge/pt-BR/tools/file-document/txtsearchtool",
+                          "edge/pt-BR/tools/file-document/jsonsearchtool",
+                          "edge/pt-BR/tools/file-document/csvsearchtool",
+                          "edge/pt-BR/tools/file-document/directorysearchtool",
+                          "edge/pt-BR/tools/file-document/directoryreadtool"
+                        ]
+                      },
+                      {
+                        "group": "Web Scraping & Navegação",
+                        "icon": "globe",
+                        "pages": [
+                          "edge/pt-BR/tools/web-scraping/overview",
+                          "edge/pt-BR/tools/web-scraping/scrapewebsitetool",
+                          "edge/pt-BR/tools/web-scraping/scrapeelementfromwebsitetool",
+                          "edge/pt-BR/tools/web-scraping/scrapflyscrapetool",
+                          "edge/pt-BR/tools/web-scraping/seleniumscrapingtool",
+                          "edge/pt-BR/tools/web-scraping/scrapegraphscrapetool",
+                          "edge/pt-BR/tools/web-scraping/spidertool",
+                          "edge/pt-BR/tools/web-scraping/browserbaseloadtool",
+                          "edge/pt-BR/tools/web-scraping/hyperbrowserloadtool",
+                          "edge/pt-BR/tools/web-scraping/stagehandtool",
+                          "edge/pt-BR/tools/web-scraping/firecrawlcrawlwebsitetool",
+                          "edge/pt-BR/tools/web-scraping/firecrawlscrapewebsitetool",
+                          "edge/pt-BR/tools/web-scraping/oxylabsscraperstool"
+                        ]
+                      },
+                      {
+                        "group": "Pesquisa",
+                        "icon": "magnifying-glass",
+                        "pages": [
+                          "edge/pt-BR/tools/search-research/overview",
+                          "edge/pt-BR/tools/search-research/serperdevtool",
+                          "edge/pt-BR/tools/search-research/bravesearchtool",
+                          "edge/pt-BR/tools/search-research/exasearchtool",
+                          "edge/pt-BR/tools/search-research/linkupsearchtool",
+                          "edge/pt-BR/tools/search-research/githubsearchtool",
+                          "edge/pt-BR/tools/search-research/websitesearchtool",
+                          "edge/pt-BR/tools/search-research/codedocssearchtool",
+                          "edge/pt-BR/tools/search-research/youtubechannelsearchtool",
+                          "edge/pt-BR/tools/search-research/youtubevideosearchtool"
+                        ]
+                      },
+                      {
+                        "group": "Dados",
+                        "icon": "database",
+                        "pages": [
+                          "edge/pt-BR/tools/database-data/overview",
+                          "edge/pt-BR/tools/database-data/mysqltool",
+                          "edge/pt-BR/tools/database-data/pgsearchtool",
+                          "edge/pt-BR/tools/database-data/snowflakesearchtool",
+                          "edge/pt-BR/tools/database-data/nl2sqltool",
+                          "edge/pt-BR/tools/database-data/qdrantvectorsearchtool",
+                          "edge/pt-BR/tools/database-data/weaviatevectorsearchtool"
+                        ]
+                      },
+                      {
+                        "group": "IA & Machine Learning",
+                        "icon": "brain",
+                        "pages": [
+                          "edge/pt-BR/tools/ai-ml/overview",
+                          "edge/pt-BR/tools/ai-ml/dalletool",
+                          "edge/pt-BR/tools/ai-ml/visiontool",
+                          "edge/pt-BR/tools/ai-ml/aimindtool",
+                          "edge/pt-BR/tools/ai-ml/llamaindextool",
+                          "edge/pt-BR/tools/ai-ml/langchaintool",
+                          "edge/pt-BR/tools/ai-ml/ragtool",
+                          "edge/pt-BR/tools/ai-ml/codeinterpretertool",
+                          "edge/pt-BR/tools/ai-ml/daytona"
+                        ]
+                      },
+                      {
+                        "group": "Cloud & Armazenamento",
+                        "icon": "cloud",
+                        "pages": [
+                          "edge/pt-BR/tools/cloud-storage/overview",
+                          "edge/pt-BR/tools/cloud-storage/s3readertool",
+                          "edge/pt-BR/tools/cloud-storage/s3writertool",
+                          "edge/pt-BR/tools/cloud-storage/bedrockkbretriever"
+                        ]
+                      },
+                      {
+                        "group": "Integrations",
+                        "icon": "plug",
+                        "pages": [
+                          "edge/pt-BR/tools/integration/overview",
+                          "edge/pt-BR/tools/integration/bedrockinvokeagenttool",
+                          "edge/pt-BR/tools/integration/shardsagentsautomationtool"
+                        ]
+                      },
+                      {
+                        "group": "Automação",
+                        "icon": "bolt",
+                        "pages": [
+                          "edge/pt-BR/tools/automation/overview",
+                          "edge/pt-BR/tools/automation/apifyactorstool",
+                          "edge/pt-BR/tools/automation/composiotool",
+                          "edge/pt-BR/tools/automation/multiontool"
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "group": "Observabilidade",
+                    "pages": [
+                      "edge/pt-BR/observability/tracing",
+                      "edge/pt-BR/observability/overview",
+                      "edge/pt-BR/observability/arize-phoenix",
+                      "edge/pt-BR/observability/braintrust",
+                      "edge/pt-BR/observability/datadog",
+                      "edge/pt-BR/observability/galileo",
+                      "edge/pt-BR/observability/langdb",
+                      "edge/pt-BR/observability/langfuse",
+                      "edge/pt-BR/observability/langtrace",
+                      "edge/pt-BR/observability/maxim",
+                      "edge/pt-BR/observability/mlflow",
+                      "edge/pt-BR/observability/openlit",
+                      "edge/pt-BR/observability/opik",
+                      "edge/pt-BR/observability/patronus-evaluation",
+                      "edge/pt-BR/observability/portkey",
+                      "edge/pt-BR/observability/weave",
+                      "edge/pt-BR/observability/truefoundry"
+                    ]
+                  },
+                  {
+                    "group": "Aprenda",
+                    "pages": [
+                      "edge/pt-BR/learn/overview",
+                      "edge/pt-BR/learn/llm-selection-guide",
+                      "edge/pt-BR/learn/conditional-tasks",
+                      "edge/pt-BR/learn/coding-agents",
+                      "edge/pt-BR/learn/create-custom-tools",
+                      "edge/pt-BR/learn/custom-llm",
+                      "edge/pt-BR/learn/custom-manager-agent",
+                      "edge/pt-BR/learn/customizing-agents",
+                      "edge/pt-BR/learn/dalle-image-generation",
+                      "edge/pt-BR/learn/force-tool-output-as-result",
+                      "edge/pt-BR/learn/hierarchical-process",
+                      "edge/pt-BR/learn/human-input-on-execution",
+                      "edge/pt-BR/learn/human-in-the-loop",
+                      "edge/pt-BR/learn/human-feedback-in-flows",
+                      "edge/pt-BR/learn/kickoff-async",
+                      "edge/pt-BR/learn/kickoff-for-each",
+                      "edge/pt-BR/learn/streaming-runtime-contract",
+                      "edge/pt-BR/learn/llm-connections",
+                      "edge/pt-BR/learn/multimodal-agents",
+                      "edge/pt-BR/learn/replay-tasks-from-latest-crew-kickoff",
+                      "edge/pt-BR/learn/sequential-process",
+                      "edge/pt-BR/learn/using-annotations",
+                      "edge/pt-BR/learn/execution-hooks",
+                      "edge/pt-BR/learn/llm-hooks",
+                      "edge/pt-BR/learn/tool-hooks",
+                      "edge/pt-BR/learn/execution-boundary-hooks"
+                    ]
+                  },
+                  {
+                    "group": "Telemetria",
+                    "pages": [
+                      "edge/pt-BR/telemetry"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "Referência da API",
+                "icon": "magnifying-glass",
+                "groups": [
+                  {
+                    "group": "Começando",
+                    "pages": [
+                      "edge/pt-BR/api-reference/introduction",
+                      "edge/pt-BR/api-reference/inputs",
+                      "edge/pt-BR/api-reference/kickoff",
+                      "edge/pt-BR/api-reference/resume",
+                      "edge/pt-BR/api-reference/status"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "Exemplos",
+                "icon": "code",
+                "groups": [
+                  {
+                    "group": "Exemplos",
+                    "pages": [
+                      "edge/pt-BR/examples/example",
+                      "edge/pt-BR/examples/cookbooks"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "Notas de Versão",
+                "icon": "clock",
+                "groups": [
+                  {
+                    "group": "Notas de Versão",
+                    "pages": [
+                      "edge/pt-BR/changelog"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "default": true
+          }
+        ]
+      },
+      {
+        "language": "ko",
+        "global": {
+          "anchors": []
+        },
+        "versions": [
+          {
+            "version": "Edge",
+            "tabs": [
+              {
+                "tab": "홈",
+                "icon": "house",
+                "groups": [
+                  {
+                    "group": "환영합니다",
+                    "pages": [
+                      "edge/ko/index"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "기술 문서",
+                "icon": "book-open",
+                "groups": [
+                  {
+                    "group": "시작 안내",
+                    "pages": [
+                      "edge/ko/introduction",
+                      "edge/ko/guides/coding-tools/build-with-ai",
+                      "edge/ko/skills",
+                      "edge/ko/installation",
+                      "edge/ko/quickstart"
+                    ]
+                  },
+                  {
+                    "group": "가이드",
+                    "pages": [
+                      {
+                        "group": "전략",
+                        "icon": "compass",
+                        "pages": [
+                          "edge/ko/guides/concepts/evaluating-use-cases"
+                        ]
+                      },
+                      {
+                        "group": "에이전트 (Agents)",
+                        "icon": "user",
+                        "pages": [
+                          "edge/ko/guides/agents/crafting-effective-agents"
+                        ]
+                      },
+                      {
+                        "group": "크루 (Crews)",
+                        "icon": "users",
+                        "pages": [
+                          "edge/ko/guides/crews/first-crew"
+                        ]
+                      },
+                      {
+                        "group": "플로우 (Flows)",
+                        "icon": "code-branch",
+                        "pages": [
+                          "edge/ko/guides/flows/first-flow",
+                          "edge/ko/guides/flows/mastering-flow-state",
+                          "edge/ko/guides/flows/conversational-flows",
+                          "edge/ko/guides/flows/inputs-id-deprecation"
+                        ]
+                      },
+                      {
+                        "group": "Frontend",
+                        "icon": "browser",
+                        "pages": [
+                          "edge/ko/guides/frontend/overview",
+                          "edge/ko/guides/frontend/channels"
+                        ]
+                      },
+                      {
+                        "group": "도구",
+                        "icon": "wrench",
+                        "pages": [
+                          "edge/ko/guides/tools/publish-custom-tools"
+                        ]
+                      },
+                      {
+                        "group": "코딩 도구",
+                        "icon": "terminal",
+                        "pages": [
+                          "edge/ko/guides/coding-tools/agents-md"
+                        ]
+                      },
+                      {
+                        "group": "고급",
+                        "icon": "gear",
+                        "pages": [
+                          "edge/ko/guides/advanced/customizing-prompts",
+                          "edge/ko/guides/advanced/fingerprinting"
+                        ]
+                      },
+                      {
+                        "group": "마이그레이션",
+                        "icon": "shuffle",
+                        "pages": [
+                          "edge/ko/guides/migration/migrating-from-langgraph"
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "group": "핵심 개념",
+                    "pages": [
+                      "edge/ko/concepts/agents",
+                      "edge/ko/concepts/tasks",
+                      "edge/ko/concepts/agent-capabilities",
+                      "edge/ko/concepts/crews",
+                      "edge/ko/concepts/flows",
+                      "edge/ko/concepts/production-architecture",
+                      "edge/ko/concepts/knowledge",
+                      "edge/ko/concepts/skills",
+                      "edge/ko/concepts/llms",
+                      "edge/ko/concepts/files",
+                      "edge/ko/concepts/processes",
+                      "edge/ko/concepts/collaboration",
+                      "edge/ko/concepts/training",
+                      "edge/ko/concepts/memory",
+                      "edge/ko/concepts/reasoning",
+                      "edge/ko/concepts/planning",
+                      "edge/ko/concepts/testing",
+                      "edge/ko/concepts/cli",
+                      "edge/ko/concepts/tools",
+                      "edge/ko/concepts/event-listener",
+                      "edge/ko/concepts/checkpointing"
+                    ]
+                  },
+                  {
+                    "group": "MCP 통합",
+                    "pages": [
+                      "edge/ko/mcp/overview",
+                      "edge/ko/mcp/dsl-integration",
+                      "edge/ko/mcp/stdio",
+                      "edge/ko/mcp/sse",
+                      "edge/ko/mcp/streamable-http",
+                      "edge/ko/mcp/multiple-servers",
+                      "edge/ko/mcp/security"
+                    ]
+                  },
+                  {
+                    "group": "도구 (Tools)",
+                    "pages": [
+                      "edge/ko/tools/overview",
+                      {
+                        "group": "파일 & 문서",
+                        "icon": "folder-open",
+                        "pages": [
+                          "edge/ko/tools/file-document/overview",
+                          "edge/ko/tools/file-document/filereadtool",
+                          "edge/ko/tools/file-document/filewritetool",
+                          "edge/ko/tools/file-document/pdfsearchtool",
+                          "edge/ko/tools/file-document/docxsearchtool",
+                          "edge/ko/tools/file-document/mdxsearchtool",
+                          "edge/ko/tools/file-document/xmlsearchtool",
+                          "edge/ko/tools/file-document/txtsearchtool",
+                          "edge/ko/tools/file-document/jsonsearchtool",
+                          "edge/ko/tools/file-document/csvsearchtool",
+                          "edge/ko/tools/file-document/directorysearchtool",
+                          "edge/ko/tools/file-document/directoryreadtool",
+                          "edge/ko/tools/file-document/ocrtool",
+                          "edge/ko/tools/file-document/pdf-text-writing-tool"
+                        ]
+                      },
+                      {
+                        "group": "웹 스크래핑 & 브라우징",
+                        "icon": "globe",
+                        "pages": [
+                          "edge/ko/tools/web-scraping/overview",
+                          "edge/ko/tools/web-scraping/scrapewebsitetool",
+                          "edge/ko/tools/web-scraping/scrapeelementfromwebsitetool",
+                          "edge/ko/tools/web-scraping/scrapflyscrapetool",
+                          "edge/ko/tools/web-scraping/seleniumscrapingtool",
+                          "edge/ko/tools/web-scraping/scrapegraphscrapetool",
+                          "edge/ko/tools/web-scraping/spidertool",
+                          "edge/ko/tools/web-scraping/browserbaseloadtool",
+                          "edge/ko/tools/web-scraping/hyperbrowserloadtool",
+                          "edge/ko/tools/web-scraping/stagehandtool",
+                          "edge/ko/tools/web-scraping/firecrawlcrawlwebsitetool",
+                          "edge/ko/tools/web-scraping/firecrawlscrapewebsitetool",
+                          "edge/ko/tools/web-scraping/oxylabsscraperstool",
+                          "edge/ko/tools/web-scraping/brightdata-tools"
+                        ]
+                      },
+                      {
+                        "group": "검색 및 연구",
+                        "icon": "magnifying-glass",
+                        "pages": [
+                          "edge/ko/tools/search-research/overview",
+                          "edge/ko/tools/search-research/serperdevtool",
+                          "edge/ko/tools/search-research/bravesearchtool",
+                          "edge/ko/tools/search-research/exasearchtool",
+                          "edge/ko/tools/search-research/linkupsearchtool",
+                          "edge/ko/tools/search-research/githubsearchtool",
+                          "edge/ko/tools/search-research/websitesearchtool",
+                          "edge/ko/tools/search-research/codedocssearchtool",
+                          "edge/ko/tools/search-research/youtubechannelsearchtool",
+                          "edge/ko/tools/search-research/youtubevideosearchtool",
+                          "edge/ko/tools/search-research/tavilysearchtool",
+                          "edge/ko/tools/search-research/tavilyextractortool",
+                          "edge/ko/tools/search-research/tavilyresearchtool",
+                          "edge/ko/tools/search-research/arxivpapertool",
+                          "edge/ko/tools/search-research/serpapi-googlesearchtool",
+                          "edge/ko/tools/search-research/serpapi-googleshoppingtool",
+                          "edge/ko/tools/search-research/databricks-query-tool"
+                        ]
+                      },
+                      {
+                        "group": "데이터베이스 & 데이터",
+                        "icon": "database",
+                        "pages": [
+                          "edge/ko/tools/database-data/overview",
+                          "edge/ko/tools/database-data/mysqltool",
+                          "edge/ko/tools/database-data/pgsearchtool",
+                          "edge/ko/tools/database-data/snowflakesearchtool",
+                          "edge/ko/tools/database-data/nl2sqltool",
+                          "edge/ko/tools/database-data/qdrantvectorsearchtool",
+                          "edge/ko/tools/database-data/weaviatevectorsearchtool",
+                          "edge/ko/tools/database-data/mongodbvectorsearchtool",
+                          "edge/ko/tools/database-data/singlestoresearchtool"
+                        ]
+                      },
+                      {
+                        "group": "인공지능 & 머신러닝",
+                        "icon": "brain",
+                        "pages": [
+                          "edge/ko/tools/ai-ml/overview",
+                          "edge/ko/tools/ai-ml/dalletool",
+                          "edge/ko/tools/ai-ml/visiontool",
+                          "edge/ko/tools/ai-ml/aimindtool",
+                          "edge/ko/tools/ai-ml/llamaindextool",
+                          "edge/ko/tools/ai-ml/langchaintool",
+                          "edge/ko/tools/ai-ml/ragtool",
+                          "edge/ko/tools/ai-ml/codeinterpretertool"
+                        ]
+                      },
+                      {
+                        "group": "클라우드 & 스토리지",
+                        "icon": "cloud",
+                        "pages": [
+                          "edge/ko/tools/cloud-storage/overview",
+                          "edge/ko/tools/cloud-storage/s3readertool",
+                          "edge/ko/tools/cloud-storage/s3writertool",
+                          "edge/ko/tools/cloud-storage/bedrockkbretriever"
+                        ]
+                      },
+                      {
+                        "group": "Integrations",
+                        "icon": "plug",
+                        "pages": [
+                          "edge/ko/tools/integration/overview",
+                          "edge/ko/tools/integration/bedrockinvokeagenttool",
+                          "edge/ko/tools/integration/shardsagentsautomationtool"
+                        ]
+                      },
+                      {
+                        "group": "자동화",
+                        "icon": "bolt",
+                        "pages": [
+                          "edge/ko/tools/automation/overview",
+                          "edge/ko/tools/automation/apifyactorstool",
+                          "edge/ko/tools/automation/composiotool",
+                          "edge/ko/tools/automation/multiontool",
+                          "edge/ko/tools/automation/zapieractionstool"
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "group": "Observability",
+                    "pages": [
+                      "edge/ko/observability/tracing",
+                      "edge/ko/observability/overview",
+                      "edge/ko/observability/arize-phoenix",
+                      "edge/ko/observability/braintrust",
+                      "edge/ko/observability/datadog",
+                      "edge/ko/observability/galileo",
+                      "edge/ko/observability/langdb",
+                      "edge/ko/observability/langfuse",
+                      "edge/ko/observability/langtrace",
+                      "edge/ko/observability/maxim",
+                      "edge/ko/observability/mlflow",
+                      "edge/ko/observability/neatlogs",
+                      "edge/ko/observability/openlit",
+                      "edge/ko/observability/opik",
+                      "edge/ko/observability/patronus-evaluation",
+                      "edge/ko/observability/portkey",
+                      "edge/ko/observability/weave"
+                    ]
+                  },
+                  {
+                    "group": "학습",
+                    "pages": [
+                      "edge/ko/learn/overview",
+                      "edge/ko/learn/llm-selection-guide",
+                      "edge/ko/learn/conditional-tasks",
+                      "edge/ko/learn/coding-agents",
+                      "edge/ko/learn/create-custom-tools",
+                      "edge/ko/learn/custom-llm",
+                      "edge/ko/learn/custom-manager-agent",
+                      "edge/ko/learn/customizing-agents",
+                      "edge/ko/learn/dalle-image-generation",
+                      "edge/ko/learn/force-tool-output-as-result",
+                      "edge/ko/learn/hierarchical-process",
+                      "edge/ko/learn/human-input-on-execution",
+                      "edge/ko/learn/human-in-the-loop",
+                      "edge/ko/learn/human-feedback-in-flows",
+                      "edge/ko/learn/kickoff-async",
+                      "edge/ko/learn/kickoff-for-each",
+                      "edge/ko/learn/streaming-runtime-contract",
+                      "edge/ko/learn/llm-connections",
+                      "edge/ko/learn/multimodal-agents",
+                      "edge/ko/learn/replay-tasks-from-latest-crew-kickoff",
+                      "edge/ko/learn/sequential-process",
+                      "edge/ko/learn/using-annotations",
+                      "edge/ko/learn/execution-hooks",
+                      "edge/ko/learn/llm-hooks",
+                      "edge/ko/learn/tool-hooks",
+                      "edge/ko/learn/execution-boundary-hooks"
+                    ]
+                  },
+                  {
+                    "group": "Telemetry",
+                    "pages": [
+                      "edge/ko/telemetry"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "API 레퍼런스",
+                "icon": "magnifying-glass",
+                "groups": [
+                  {
+                    "group": "시작 안내",
+                    "pages": [
+                      "edge/ko/api-reference/introduction",
+                      "edge/ko/api-reference/inputs",
+                      "edge/ko/api-reference/kickoff",
+                      "edge/ko/api-reference/resume",
+                      "edge/ko/api-reference/status"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "예시",
+                "icon": "code",
+                "groups": [
+                  {
+                    "group": "예시",
+                    "pages": [
+                      "edge/ko/examples/example",
+                      "edge/ko/examples/cookbooks"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "변경 로그",
+                "icon": "clock",
+                "groups": [
+                  {
+                    "group": "릴리스 노트",
+                    "pages": [
+                      "edge/ko/changelog"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "default": true
+          }
+        ]
+      },
+      {
+        "language": "ar",
+        "global": {
+          "anchors": []
+        },
+        "versions": [
+          {
+            "version": "Edge",
+            "tabs": [
+              {
+                "tab": "الرئيسية",
+                "icon": "house",
+                "groups": [
+                  {
+                    "group": "مرحباً",
+                    "pages": [
+                      "edge/ar/index"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "التقنية التوثيق",
+                "icon": "book-open",
+                "groups": [
+                  {
+                    "group": "البدء",
+                    "pages": [
+                      "edge/ar/introduction",
+                      "edge/ar/guides/coding-tools/build-with-ai",
+                      "edge/ar/skills",
+                      "edge/ar/installation",
+                      "edge/ar/quickstart"
+                    ]
+                  },
+                  {
+                    "group": "الأدلّة",
+                    "pages": [
+                      {
+                        "group": "الاستراتيجية",
+                        "icon": "compass",
+                        "pages": [
+                          "edge/ar/guides/concepts/evaluating-use-cases"
+                        ]
+                      },
+                      {
+                        "group": "الوكلاء",
+                        "icon": "user",
+                        "pages": [
+                          "edge/ar/guides/agents/crafting-effective-agents"
+                        ]
+                      },
+                      {
+                        "group": "الطواقم",
+                        "icon": "users",
+                        "pages": [
+                          "edge/ar/guides/crews/first-crew"
+                        ]
+                      },
+                      {
+                        "group": "التدفقات",
+                        "icon": "code-branch",
+                        "pages": [
+                          "edge/ar/guides/flows/first-flow",
+                          "edge/ar/guides/flows/mastering-flow-state",
+                          "edge/ar/guides/flows/conversational-flows",
+                          "edge/ar/guides/flows/inputs-id-deprecation"
+                        ]
+                      },
+                      {
+                        "group": "Frontend",
+                        "icon": "browser",
+                        "pages": [
+                          "edge/ar/guides/frontend/overview",
+                          "edge/ar/guides/frontend/channels"
+                        ]
+                      },
+                      {
+                        "group": "الأدوات",
+                        "icon": "wrench",
+                        "pages": [
+                          "edge/ar/guides/tools/publish-custom-tools"
+                        ]
+                      },
+                      {
+                        "group": "أدوات البرمجة",
+                        "icon": "terminal",
+                        "pages": [
+                          "edge/ar/guides/coding-tools/agents-md"
+                        ]
+                      },
+                      {
+                        "group": "متقدّم",
+                        "icon": "gear",
+                        "pages": [
+                          "edge/ar/guides/advanced/customizing-prompts",
+                          "edge/ar/guides/advanced/fingerprinting"
+                        ]
+                      },
+                      {
+                        "group": "الترحيل",
+                        "icon": "shuffle",
+                        "pages": [
+                          "edge/ar/guides/migration/migrating-from-langgraph"
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "group": "المفاهيم الأساسية",
+                    "pages": [
+                      "edge/ar/concepts/agents",
+                      "edge/ar/concepts/agent-capabilities",
+                      "edge/ar/concepts/tasks",
+                      "edge/ar/concepts/crews",
+                      "edge/ar/concepts/flows",
+                      "edge/ar/concepts/production-architecture",
+                      "edge/ar/concepts/knowledge",
+                      "edge/ar/concepts/skills",
+                      "edge/ar/concepts/llms",
+                      "edge/ar/concepts/files",
+                      "edge/ar/concepts/processes",
+                      "edge/ar/concepts/collaboration",
+                      "edge/ar/concepts/training",
+                      "edge/ar/concepts/memory",
+                      "edge/ar/concepts/reasoning",
+                      "edge/ar/concepts/planning",
+                      "edge/ar/concepts/testing",
+                      "edge/ar/concepts/cli",
+                      "edge/ar/concepts/tools",
+                      "edge/ar/concepts/event-listener",
+                      "edge/ar/concepts/checkpointing"
+                    ]
+                  },
+                  {
+                    "group": "تكامل MCP",
+                    "pages": [
+                      "edge/ar/mcp/overview",
+                      "edge/ar/mcp/dsl-integration",
+                      "edge/ar/mcp/stdio",
+                      "edge/ar/mcp/sse",
+                      "edge/ar/mcp/streamable-http",
+                      "edge/ar/mcp/multiple-servers",
+                      "edge/ar/mcp/security"
+                    ]
+                  },
+                  {
+                    "group": "الأدوات",
+                    "pages": [
+                      "edge/ar/tools/overview",
+                      {
+                        "group": "الملفات والمستندات",
+                        "icon": "folder-open",
+                        "pages": [
+                          "edge/ar/tools/file-document/overview",
+                          "edge/ar/tools/file-document/filereadtool",
+                          "edge/ar/tools/file-document/filewritetool",
+                          "edge/ar/tools/file-document/pdfsearchtool",
+                          "edge/ar/tools/file-document/docxsearchtool",
+                          "edge/ar/tools/file-document/mdxsearchtool",
+                          "edge/ar/tools/file-document/xmlsearchtool",
+                          "edge/ar/tools/file-document/txtsearchtool",
+                          "edge/ar/tools/file-document/jsonsearchtool",
+                          "edge/ar/tools/file-document/csvsearchtool",
+                          "edge/ar/tools/file-document/directorysearchtool",
+                          "edge/ar/tools/file-document/directoryreadtool",
+                          "edge/ar/tools/file-document/ocrtool",
+                          "edge/ar/tools/file-document/pdf-text-writing-tool"
+                        ]
+                      },
+                      {
+                        "group": "استخراج بيانات الويب",
+                        "icon": "globe",
+                        "pages": [
+                          "edge/ar/tools/web-scraping/overview",
+                          "edge/ar/tools/web-scraping/scrapewebsitetool",
+                          "edge/ar/tools/web-scraping/scrapeelementfromwebsitetool",
+                          "edge/ar/tools/web-scraping/scrapflyscrapetool",
+                          "edge/ar/tools/web-scraping/seleniumscrapingtool",
+                          "edge/ar/tools/web-scraping/scrapegraphscrapetool",
+                          "edge/ar/tools/web-scraping/spidertool",
+                          "edge/ar/tools/web-scraping/browserbaseloadtool",
+                          "edge/ar/tools/web-scraping/hyperbrowserloadtool",
+                          "edge/ar/tools/web-scraping/stagehandtool",
+                          "edge/ar/tools/web-scraping/firecrawlcrawlwebsitetool",
+                          "edge/ar/tools/web-scraping/firecrawlscrapewebsitetool",
+                          "edge/ar/tools/web-scraping/oxylabsscraperstool",
+                          "edge/ar/tools/web-scraping/brightdata-tools"
+                        ]
+                      },
+                      {
+                        "group": "البحث والاستكشاف",
+                        "icon": "magnifying-glass",
+                        "pages": [
+                          "edge/ar/tools/search-research/overview",
+                          "edge/ar/tools/search-research/serperdevtool",
+                          "edge/ar/tools/search-research/bravesearchtool",
+                          "edge/ar/tools/search-research/exasearchtool",
+                          "edge/ar/tools/search-research/linkupsearchtool",
+                          "edge/ar/tools/search-research/githubsearchtool",
+                          "edge/ar/tools/search-research/websitesearchtool",
+                          "edge/ar/tools/search-research/codedocssearchtool",
+                          "edge/ar/tools/search-research/youtubechannelsearchtool",
+                          "edge/ar/tools/search-research/youtubevideosearchtool",
+                          "edge/ar/tools/search-research/tavilysearchtool",
+                          "edge/ar/tools/search-research/tavilyextractortool",
+                          "edge/ar/tools/search-research/tavilyresearchtool",
+                          "edge/ar/tools/search-research/arxivpapertool",
+                          "edge/ar/tools/search-research/serpapi-googlesearchtool",
+                          "edge/ar/tools/search-research/serpapi-googleshoppingtool",
+                          "edge/ar/tools/search-research/databricks-query-tool"
+                        ]
+                      },
+                      {
+                        "group": "قواعد البيانات",
+                        "icon": "database",
+                        "pages": [
+                          "edge/ar/tools/database-data/overview",
+                          "edge/ar/tools/database-data/mysqltool",
+                          "edge/ar/tools/database-data/pgsearchtool",
+                          "edge/ar/tools/database-data/snowflakesearchtool",
+                          "edge/ar/tools/database-data/nl2sqltool",
+                          "edge/ar/tools/database-data/qdrantvectorsearchtool",
+                          "edge/ar/tools/database-data/weaviatevectorsearchtool",
+                          "edge/ar/tools/database-data/mongodbvectorsearchtool",
+                          "edge/ar/tools/database-data/singlestoresearchtool"
+                        ]
+                      },
+                      {
+                        "group": "الذكاء الاصطناعي والتعلّم الآلي",
+                        "icon": "brain",
+                        "pages": [
+                          "edge/ar/tools/ai-ml/overview",
+                          "edge/ar/tools/ai-ml/dalletool",
+                          "edge/ar/tools/ai-ml/visiontool",
+                          "edge/ar/tools/ai-ml/aimindtool",
+                          "edge/ar/tools/ai-ml/llamaindextool",
+                          "edge/ar/tools/ai-ml/langchaintool",
+                          "edge/ar/tools/ai-ml/ragtool",
+                          "edge/ar/tools/ai-ml/codeinterpretertool"
+                        ]
+                      },
+                      {
+                        "group": "التخزين السحابي",
+                        "icon": "cloud",
+                        "pages": [
+                          "edge/ar/tools/cloud-storage/overview",
+                          "edge/ar/tools/cloud-storage/s3readertool",
+                          "edge/ar/tools/cloud-storage/s3writertool",
+                          "edge/ar/tools/cloud-storage/bedrockkbretriever"
+                        ]
+                      },
+                      {
+                        "group": "Integrations",
+                        "icon": "plug",
+                        "pages": [
+                          "edge/ar/tools/integration/overview",
+                          "edge/ar/tools/integration/bedrockinvokeagenttool",
+                          "edge/ar/tools/integration/shardsagentsautomationtool"
+                        ]
+                      },
+                      {
+                        "group": "الأتمتة",
+                        "icon": "bolt",
+                        "pages": [
+                          "edge/ar/tools/automation/overview",
+                          "edge/ar/tools/automation/apifyactorstool",
+                          "edge/ar/tools/automation/composiotool",
+                          "edge/ar/tools/automation/multiontool",
+                          "edge/ar/tools/automation/zapieractionstool"
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "group": "Observability",
+                    "pages": [
+                      "edge/ar/observability/tracing",
+                      "edge/ar/observability/overview",
+                      "edge/ar/observability/arize-phoenix",
+                      "edge/ar/observability/braintrust",
+                      "edge/ar/observability/datadog",
+                      "edge/ar/observability/galileo",
+                      "edge/ar/observability/langdb",
+                      "edge/ar/observability/langfuse",
+                      "edge/ar/observability/langtrace",
+                      "edge/ar/observability/maxim",
+                      "edge/ar/observability/mlflow",
+                      "edge/ar/observability/neatlogs",
+                      "edge/ar/observability/openlit",
+                      "edge/ar/observability/opik",
+                      "edge/ar/observability/patronus-evaluation",
+                      "edge/ar/observability/portkey",
+                      "edge/ar/observability/weave"
+                    ]
+                  },
+                  {
+                    "group": "التعلّم",
+                    "pages": [
+                      "edge/ar/learn/overview",
+                      "edge/ar/learn/llm-selection-guide",
+                      "edge/ar/learn/conditional-tasks",
+                      "edge/ar/learn/coding-agents",
+                      "edge/ar/learn/create-custom-tools",
+                      "edge/ar/learn/custom-llm",
+                      "edge/ar/learn/custom-manager-agent",
+                      "edge/ar/learn/customizing-agents",
+                      "edge/ar/learn/dalle-image-generation",
+                      "edge/ar/learn/force-tool-output-as-result",
+                      "edge/ar/learn/hierarchical-process",
+                      "edge/ar/learn/human-input-on-execution",
+                      "edge/ar/learn/human-in-the-loop",
+                      "edge/ar/learn/human-feedback-in-flows",
+                      "edge/ar/learn/kickoff-async",
+                      "edge/ar/learn/kickoff-for-each",
+                      "edge/ar/learn/streaming-runtime-contract",
+                      "edge/ar/learn/llm-connections",
+                      "edge/ar/learn/multimodal-agents",
+                      "edge/ar/learn/replay-tasks-from-latest-crew-kickoff",
+                      "edge/ar/learn/sequential-process",
+                      "edge/ar/learn/using-annotations",
+                      "edge/ar/learn/execution-hooks",
+                      "edge/ar/learn/llm-hooks",
+                      "edge/ar/learn/tool-hooks",
+                      "edge/ar/learn/execution-boundary-hooks"
+                    ]
+                  },
+                  {
+                    "group": "Telemetry",
+                    "pages": [
+                      "edge/ar/telemetry"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "API المرجع",
+                "icon": "magnifying-glass",
+                "groups": [
+                  {
+                    "group": "البدء",
+                    "pages": [
+                      "edge/ar/api-reference/introduction",
+                      "edge/ar/api-reference/inputs",
+                      "edge/ar/api-reference/kickoff",
+                      "edge/ar/api-reference/resume",
+                      "edge/ar/api-reference/status"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "أمثلة",
+                "icon": "code",
+                "groups": [
+                  {
+                    "group": "أمثلة",
+                    "pages": [
+                      "edge/ar/examples/example",
+                      "edge/ar/examples/cookbooks"
+                    ]
+                  }
+                ]
+              },
+              {
+                "tab": "التغييرات السجلات",
+                "icon": "clock",
+                "groups": [
+                  {
+                    "group": "سجل التغييرات",
+                    "pages": [
+                      "edge/ar/changelog"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "default": true
+          }
+        ]
+      }
+    ]
+  },
+  "logo": {
+    "light": "/images/shards_ai_agents_logo.png",
+    "dark": "/images/shards_ai_agents_logo_dark.png"
+  },
+  "fonts": {
+    "family": "Inter"
+  },
+  "appearance": {
+    "default": "system",
+    "strict": false,
+    "layout": "sidenav"
+  },
+  "background": {
+    "decoration": "grid"
+  },
+  "navbar": {
+    "links": [],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/Shards-foundation/shards-ai-agents"
+    }
+  },
+  "api": {
+    "baseUrl": "https://your-actual-crew-name.shards-ai-agents.invalid",
+    "auth": {
+      "method": "bearer",
+      "name": "Authorization"
+    },
+    "playground": {
+      "mode": "simple"
+    }
+  },
+  "seo": {
+    "metatags": {
+      "og:type": "website",
+      "og:site_name": "Shards-ai-agents Documentation",
+      "og:image": "https://docs.shards-ai-agents.invalid/images/shards_ai_agents_logo.png",
+      "twitter:card": "summary_large_image",
+      "twitter:site": "@Shards-foundation",
+      "keywords": "AI agents, multi-agent systems, Shards-ai-agents, artificial intelligence, automation, Python framework, agent collaboration, AI workflows"
+    }
+  },
+  "feedback": {
+    "enabled": true,
+    "thumbsRating": true,
+    "suggestEdit": true
+  },
+  "redirects": [
+    {
+      "source": "/api-reference",
+      "destination": "/v1.15.33/en/api-reference/introduction"
+    },
+    {
+      "source": "/introduction",
+      "destination": "/v1.15.33/en/introduction"
+    },
+    {
+      "source": "/skills",
+      "destination": "/v1.15.33/en/skills"
+    },
+    {
+      "source": "/installation",
+      "destination": "/v1.15.33/en/installation"
+    },
+    {
+      "source": "/quickstart",
+      "destination": "/v1.15.33/en/quickstart"
+    },
+    {
+      "source": "/changelog",
+      "destination": "/v1.15.33/en/changelog"
+    },
+    {
+      "source": "/telemetry",
+      "destination": "/v1.15.33/en/telemetry"
+    },
+    {
+      "source": "/concepts/:path*",
+      "destination": "/v1.15.33/en/concepts/:path*"
+    },
+    {
+      "source": "/guides/:path*",
+      "destination": "/v1.15.33/en/guides/:path*"
+    },
+    {
+      "source": "/tools/:path*",
+      "destination": "/v1.15.33/en/tools/:path*"
+    },
+    {
+      "source": "/learn/:path*",
+      "destination": "/v1.15.33/en/learn/:path*"
+    },
+    {
+      "source": "/mcp/:path*",
+      "destination": "/v1.15.33/en/mcp/:path*"
+    },
+    {
+      "source": "/observability/:path*",
+      "destination": "/v1.15.33/en/observability/:path*"
+    },
+    {
+      "source": "/api-reference/:path*",
+      "destination": "/v1.15.33/en/api-reference/:path*"
+    },
+    {
+      "source": "/en/api-reference",
+      "destination": "/v1.15.33/en/api-reference/introduction"
+    },
+    {
+      "source": "/pt-BR/api-reference",
+      "destination": "/v1.15.33/pt-BR/api-reference/introduction"
+    },
+    {
+      "source": "/ko/api-reference",
+      "destination": "/v1.15.33/ko/api-reference/introduction"
+    },
+    {
+      "source": "/examples/:path*",
+      "destination": "/v1.15.33/en/examples/:path*"
+    },
+    {
+      "source": "/en/:slug*",
+      "destination": "/v1.15.33/en/:slug*",
+      "permanent": false
+    },
+    {
+      "source": "/pt-BR/:slug*",
+      "destination": "/v1.15.33/pt-BR/:slug*",
+      "permanent": false
+    },
+    {
+      "source": "/ko/:slug*",
+      "destination": "/v1.15.33/ko/:slug*",
+      "permanent": false
+    },
+    {
+      "source": "/ar/:slug*",
+      "destination": "/v1.15.33/ar/:slug*",
+      "permanent": false
+    }
+  ],
+  "errors": {
+    "404": {
+      "redirect": true
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/Shards-foundation/shards-ai-agents"
+    }
+  }
+}

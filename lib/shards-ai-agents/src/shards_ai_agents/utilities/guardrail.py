@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+import warnings
+
+from pydantic import BaseModel, Field, model_validator
+from typing_extensions import Self
+
+from shards_ai_agents.utilities.guardrail_types import GuardrailCallable
+
+
+def serialize_guardrail_for_json(
+    value: Any, field_name: str = "guardrail"
+) -> str | None:
+    """Serialize a single guardrail value for JSON checkpointing.
+
+    String descriptions are preserved; callable references cannot be
+    JSON-serialized and are dropped with a warning so users know the
+    guardrail will not be present after a checkpoint restore.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    if callable(value):
+        warnings.warn(
+            f"Callable {field_name!r} cannot be JSON-serialized and will be dropped "
+            f"during checkpointing; restored checkpoints will not run this guardrail.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+    return None
+
+
+def serialize_guardrails_for_json(
+    value: Any, field_name: str = "guardrails"
+) -> list[str] | str | None:
+    """Serialize a guardrails value (single or sequence) for JSON checkpointing.
+
+    Dropped callables are filtered out of lists rather than emitted as ``None``;
+    a ``None`` entry would fail validation against ``GuardrailCallable | str``
+    on checkpoint restore.
+    """
+    if isinstance(value, (list, tuple)):
+        return [
+            item
+            for item in (serialize_guardrail_for_json(g, field_name) for g in value)
+            if item is not None
+        ]
+    return serialize_guardrail_for_json(value, field_name)
+
+
+if TYPE_CHECKING:
+    from shards_ai_agents.agents.agent_builder.base_agent import BaseAgent
+    from shards_ai_agents.lite_agent import LiteAgent
+    from shards_ai_agents.lite_agent_output import LiteAgentOutput
+    from shards_ai_agents.task import Task
+    from shards_ai_agents.tasks.task_output import TaskOutput
+
+
+class GuardrailResult(BaseModel):
+    """Result from a task guardrail execution.
+
+    This class standardizes the return format of task guardrails,
+    converting tuple responses into a structured format that can
+    be easily handled by the task execution system.
+
+    Attributes:
+        success: Whether the guardrail validation passed
+        result: The validated/transformed result if successful
+        error: Error message if validation failed
+    """
+
+    success: bool = Field(description="Whether the guardrail validation passed")
+    result: Any | None = Field(
+        default=None, description="The validated/transformed result if successful"
+    )
+    error: str | None = Field(
+        default=None, description="Error message if validation failed"
+    )
+
+    @model_validator(mode="after")
+    def validate_result_error_exclusivity(self) -> Self:
+        """Ensure that result and error are mutually exclusive based on success.
+
+        Runs on the fully constructed instance: a per-field validator cannot
+        see fields declared after the one being validated, so the success=True
+        case could never observe a non-empty ``error``.
+
+        Returns:
+          The validated instance.
+        """
+        if self.result and self.error:
+            if self.success:
+                raise ValueError(
+                    "Cannot have both result and error when success is True"
+                )
+            raise ValueError("Cannot have both result and error when success is False")
+        return self
+
+    @classmethod
+    def from_tuple(cls, result: tuple[bool, Any | str]) -> Self:
+        """Create a GuardrailResult from a validation tuple.
+
+        Args:
+            result: A tuple of (success, data) where data is either the validated result or error message.
+
+        Returns:
+            A new instance with the tuple data.
+        """
+        success, data = result
+        return cls(
+            success=success,
+            result=data if success else None,
+            error=data if not success else None,
+        )
+
+
+def process_guardrail(
+    output: TaskOutput | LiteAgentOutput,
+    guardrail: GuardrailCallable,
+    retry_count: int,
+    event_source: Any | None = None,
+    from_agent: BaseAgent | LiteAgent | None = None,
+    from_task: Task | None = None,
+) -> GuardrailResult:
+    """Process the guardrail for the agent output.
+
+    Args:
+        output: The output to validate with the guardrail
+        guardrail: The guardrail to validate the output with
+        retry_count: The number of times the guardrail has been retried
+        event_source: The source of the guardrail to be sent in events
+        from_agent: The agent that produced the output
+        from_task: The task that produced the output
+
+    Returns:
+        GuardrailResult: The result of the guardrail validation
+
+    Raises:
+        TypeError: If output is not a TaskOutput or LiteAgentOutput
+        ValueError: If guardrail is None
+        HookAborted: A `pre_model_call` hook denied an LLM-backed guardrail.
+    """
+    from shards_ai_agents.lite_agent_output import LiteAgentOutput
+    from shards_ai_agents.tasks.task_output import TaskOutput
+
+    if not isinstance(output, (TaskOutput, LiteAgentOutput)):
+        raise TypeError("Output must be a TaskOutput or LiteAgentOutput")
+    if guardrail is None:
+        raise ValueError("Guardrail must not be None")
+
+    from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+    from shards_ai_agents.events.types.llm_guardrail_events import (
+        LLMGuardrailCompletedEvent,
+        LLMGuardrailStartedEvent,
+    )
+    from shards_ai_agents.hooks.dispatch import HookAborted
+
+    started_event = LLMGuardrailStartedEvent(
+        guardrail=guardrail,
+        retry_count=retry_count,
+        from_agent=from_agent,
+        from_task=from_task,
+    )
+    shards_ai_agents_event_bus.emit(event_source, started_event)
+
+    try:
+        result = guardrail(output)
+        guardrail_result = GuardrailResult.from_tuple(result)
+    except HookAborted as e:
+        # a deny ends the validation, so the started event above still needs a
+        # terminal one before it leaves
+        shards_ai_agents_event_bus.emit(
+            event_source,
+            LLMGuardrailCompletedEvent(
+                success=False,
+                result=None,
+                error=str(e),
+                retry_count=retry_count,
+                guardrail_type=started_event.guardrail_type,
+                guardrail_name=started_event.guardrail_name,
+                from_agent=from_agent,
+                from_task=from_task,
+            ),
+        )
+        raise
+    except Exception as e:
+        # an exception ends the validation too; without a terminal event the
+        # "evaluate guardrail" span survives until the end-of-execution sweep
+        # closes it as orphaned, and the trace loses the real error
+        shards_ai_agents_event_bus.emit(
+            event_source,
+            LLMGuardrailCompletedEvent(
+                success=False,
+                result=None,
+                error=f"{type(e).__name__}: {e}",
+                retry_count=retry_count,
+                guardrail_type=started_event.guardrail_type,
+                guardrail_name=started_event.guardrail_name,
+                from_agent=from_agent,
+                from_task=from_task,
+            ),
+        )
+        raise
+
+    shards_ai_agents_event_bus.emit(
+        event_source,
+        LLMGuardrailCompletedEvent(
+            success=guardrail_result.success,
+            result=guardrail_result.result,
+            error=guardrail_result.error,
+            retry_count=retry_count,
+            guardrail_type=started_event.guardrail_type,
+            guardrail_name=started_event.guardrail_name,
+            from_agent=from_agent,
+            from_task=from_task,
+        ),
+    )
+
+    return guardrail_result

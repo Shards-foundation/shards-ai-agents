@@ -1,0 +1,1998 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable, Iterator, Sequence
+import concurrent.futures
+import contextlib
+import contextvars
+from dataclasses import dataclass, field
+from datetime import datetime
+import inspect
+import json
+import logging
+import re
+from typing import TYPE_CHECKING, Any, Final
+
+from pydantic import BaseModel
+from rich.console import Console
+from rich.panel import Panel
+from shards_ai_agents_core.printer import ColoredText, Printer
+from shards_ai_agents_core.settings import Settings
+
+from shards_ai_agents.agents.constants import (
+    FINAL_ANSWER_AND_PARSABLE_ACTION_ERROR_MESSAGE,
+)
+from shards_ai_agents.agents.parser import (
+    AgentAction,
+    AgentFinish,
+    OutputParserError,
+    parse,
+)
+from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+from shards_ai_agents.events.types.llm_events import (
+    ContextWindowSummarizationCompletedEvent,
+    ContextWindowSummarizationFailedEvent,
+    ContextWindowSummarizationStartedEvent,
+)
+from shards_ai_agents.hooks.dispatch import HookAborted
+from shards_ai_agents.llms.base_llm import (
+    BaseLLM,
+    LLMCallBlockedError,
+    call_stop_override,
+)
+from shards_ai_agents.tools import BaseTool as ShardsAgentsTool
+from shards_ai_agents.tools.base_tool import BaseTool
+from shards_ai_agents.tools.structured_tool import (
+    CrewStructuredTool,
+    strip_composite_description_prefix,
+)
+from shards_ai_agents.tools.tool_failure import (
+    ToolExecutionFailedError,
+    ToolFailure,
+    ToolFailureReason,
+    ToolFailureRecord,
+    detect_tool_failure,
+    failure_from_exception,
+    handle_tool_failure,
+    reportable_failure,
+)
+from shards_ai_agents.tools.tool_types import ToolResult
+from shards_ai_agents.utilities.errors import AgentRepositoryError
+from shards_ai_agents.utilities.exceptions.context_window_exceeding_exception import (
+    LLMContextLengthExceededError,
+)
+from shards_ai_agents.utilities.i18n import I18N_DEFAULT
+from shards_ai_agents.utilities.message_utils import (
+    format_message_for_llm,
+    message_content_text as message_content_text,
+)
+from shards_ai_agents.utilities.pydantic_schema_utils import generate_model_description
+from shards_ai_agents.utilities.string_utils import sanitize_tool_name
+from shards_ai_agents.utilities.token_counter_callback import TokenCalcHandler
+from shards_ai_agents.utilities.types import LLMMessage
+
+
+if TYPE_CHECKING:
+    from shards_ai_agents.agents.agent_builder.base_agent import BaseAgent
+    from shards_ai_agents.agents.agent_executor import AgentExecutor
+    from shards_ai_agents.agents.tools_handler import ToolsHandler
+    from shards_ai_agents.lite_agent import LiteAgent
+    from shards_ai_agents.llm import LLM
+    from shards_ai_agents.task import Task
+
+_create_plus_client_hook: Callable[[], Any] | None = None
+logger = logging.getLogger(__name__)
+
+
+def resolve_plus_client(default: Callable[[], Any]) -> Any:
+    """Return the Shards-ai-agents AMP client to use, or build ``default``.
+
+    Hosted runtimes install a client of their own through
+    ``_create_plus_client_hook``, authenticated for the environment they run in.
+    Every registry lookup resolves through here so they all share that client.
+
+    Args:
+        default: Builds the client to use when no hook is installed. A callable
+            rather than a value so credential lookups that raise when absent are
+            only evaluated when they're actually needed.
+
+    Returns:
+        A Shards-ai-agents AMP client.
+    """
+    if callable(_create_plus_client_hook):
+        return _create_plus_client_hook()
+    return default()
+
+
+def resolve_plus_response(response: Any) -> Any:
+    """Return ``response``, awaiting it first when the client is async.
+
+    Args:
+        response: A response, or an awaitable resolving to one.
+
+    Returns:
+        The resolved response.
+
+    Raises:
+        TypeError: If the awaitable is already bound to a loop (a Task or
+            Future), which can't be resolved synchronously.
+    """
+    if not inspect.isawaitable(response):
+        return response
+
+    if isinstance(response, asyncio.Future):
+        raise TypeError(
+            "Shards-ai-agents AMP clients must return a coroutine, not a Task or Future "
+            "already bound to a running loop."
+        )
+
+    # asyncio.run() takes a coroutine specifically, while isawaitable() also
+    # covers custom __await__ objects, so wrap rather than passing it through.
+    async def await_response() -> Any:
+        return await response
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    # asyncio.run() refuses to nest inside a running loop, so hand the coroutine
+    # to a worker thread with a loop of its own — carrying a copy of the caller's
+    # context, since a fresh thread would otherwise start with empty ContextVars
+    # and a client reading runtime state (the platform token, flow context) would
+    # see defaults.
+    if loop and loop.is_running():
+        ctx = contextvars.copy_context()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(ctx.run, asyncio.run, await_response()).result()
+
+    return asyncio.run(await_response())
+
+
+console = Console()
+
+_MULTIPLE_NEWLINES: Final[re.Pattern[str]] = re.compile(r"\n+")
+_NATIVE_TOOL_UNSUPPORTED_PATTERNS: Final[tuple[str, ...]] = (
+    "does not support tools",
+    "doesn't support tools",
+    "tools are not supported",
+    "tool calling is not supported",
+    "tool calls are not supported",
+    "function calling is not supported",
+    "does not support function calling",
+)
+
+
+def is_inside_event_loop() -> bool:
+    """Check if code is currently running inside an asyncio event loop.
+
+    This is used to detect when code is being called from within an async context
+    (e.g., inside a Flow). In such cases, callers should return a coroutine
+    instead of executing synchronously to avoid nested event loop errors.
+
+    Returns:
+        True if inside a running event loop, False otherwise.
+    """
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+def parse_tools(tools: list[BaseTool]) -> list[CrewStructuredTool]:
+    """Parse tools to be used for the task.
+
+    Args:
+        tools: List of tools to parse.
+
+    Returns:
+        List of structured tools.
+
+    Raises:
+        ValueError: If a tool is not a CrewStructuredTool or BaseTool.
+    """
+    tools_list: list[CrewStructuredTool] = []
+
+    for tool in tools:
+        if isinstance(tool, ShardsAgentsTool):
+            structured_tool = tool.to_structured_tool()
+            structured_tool.current_usage_count = 0
+            if structured_tool._original_tool:
+                structured_tool._original_tool.current_usage_count = 0
+            tools_list.append(structured_tool)
+        else:
+            raise ValueError("Tool is not a CrewStructuredTool or BaseTool")
+
+    return tools_list
+
+
+def get_tool_names(tools: Sequence[CrewStructuredTool | BaseTool]) -> str:
+    """Get the sanitized names of the tools.
+
+    Args:
+        tools: List of tools to get names from.
+
+    Returns:
+        Comma-separated string of sanitized tool names.
+    """
+    return ", ".join([sanitize_tool_name(t.name) for t in tools])
+
+
+def render_text_description_and_args(
+    tools: Sequence[CrewStructuredTool | BaseTool],
+) -> str:
+    """Render the tool name, description, and args in plain text.
+
+    search: This tool is used for search, args: {"query": {"type": "string"}}
+    calculator: This tool is used for math, \
+    args: {"expression": {"type": "string"}}
+
+    Args:
+        tools: List of tools to render.
+
+    Returns:
+        Plain text description of tools.
+    """
+    # Fall back to the raw description for duck-typed tools (including test
+    # mocks) that don't provide a real formatted_description string.
+    tool_strings = [
+        formatted
+        if isinstance((formatted := getattr(tool, "formatted_description", None)), str)
+        else tool.description
+        for tool in tools
+    ]
+    return "\n".join(tool_strings)
+
+
+def convert_tools_to_openai_schema(
+    tools: Sequence[BaseTool | CrewStructuredTool],
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, Callable[..., Any]],
+    dict[str, BaseTool | CrewStructuredTool],
+]:
+    """Convert Shards-ai-agents tools to OpenAI function calling format.
+
+    This function converts Shards-ai-agents BaseTool and CrewStructuredTool objects
+    into the OpenAI-compatible tool schema format that can be passed to
+    LLM providers for native function calling.
+
+    Args:
+        tools: List of Shards-ai-agents tool objects to convert.
+
+    Returns:
+        Tuple containing:
+        - List of OpenAI-format tool schema dictionaries
+        - Dict mapping sanitized tool names to their callable run() methods
+        - Dict mapping sanitized tool names to their original tool objects
+    """
+    openai_tools: list[dict[str, Any]] = []
+    available_functions: dict[str, Callable[..., Any]] = {}
+    tool_name_mapping: dict[str, BaseTool | CrewStructuredTool] = {}
+
+    for tool in tools:
+        parameters: dict[str, Any] = {}
+        if hasattr(tool, "args_schema") and tool.args_schema is not None:
+            try:
+                schema_output = generate_model_description(
+                    tool.args_schema, strip_null_types=False
+                )
+                parameters = schema_output.get("json_schema", {}).get("schema", {})
+                parameters.pop("title", None)
+                parameters.pop("description", None)
+            except Exception:
+                parameters = {}
+
+        # Old checkpoints and some adapters bake the composed LLM block
+        # ("Tool Name: ...\nTool Arguments: ...\nTool Description: {authored}")
+        # into the description field; keep only the authored text here.
+        description = strip_composite_description_prefix(tool.description)
+
+        sanitized_name = sanitize_tool_name(tool.name)
+
+        if sanitized_name in available_functions:
+            counter = 2
+            candidate = sanitize_tool_name(f"{sanitized_name}_{counter}")
+            while candidate in available_functions:
+                counter += 1
+                candidate = sanitize_tool_name(f"{sanitized_name}_{counter}")
+            sanitized_name = candidate
+
+        schema: dict[str, Any] = {
+            "type": "function",
+            "function": {
+                "name": sanitized_name,
+                "description": description,
+                "parameters": parameters,
+                "strict": True,
+            },
+        }
+        openai_tools.append(schema)
+        available_functions[sanitized_name] = tool.run  # type: ignore[union-attr]
+        tool_name_mapping[sanitized_name] = tool
+
+    return openai_tools, available_functions, tool_name_mapping
+
+
+def extract_task_section(text: str) -> str:
+    """Extract the ## Task body from a structured enriched instruction.
+
+    For structured descriptions (e.g. with ## Task and ## Instructions sections),
+    extracts just the task body so the caller sees the requirements without
+    duplicating tool/verification instructions.
+
+    Falls back to the full text (up to 2000 chars, with a truncation marker)
+    for plain inputs.
+    """
+    for marker in ("\n## Task\n", "\n## Task:", "## Task\n"):
+        idx = text.find(marker)
+        if idx >= 0:
+            start = idx + len(marker)
+            for end_marker in ("\n---\n", "\n## "):
+                end = text.find(end_marker, start)
+                if end > 0:
+                    return text[start:end].strip()
+            return text[start : start + 2000].strip()
+    if len(text) > 2000:
+        return text[:2000] + "\n... [truncated]"
+    return text
+
+
+def _executor_stop_words(
+    executor_context: AgentExecutor | LiteAgent | None,
+) -> list[str]:
+    """Return the executor's stop words, regardless of which field name it uses."""
+    if executor_context is None:
+        return []
+    stops = getattr(executor_context, "stop", None)
+    if stops is None:
+        stops = getattr(executor_context, "stop_words", None)
+    return list(stops) if stops else []
+
+
+@contextlib.contextmanager
+def _llm_stop_words_applied(
+    llm: LLM | BaseLLM,
+    executor_context: AgentExecutor | LiteAgent | None,
+) -> Iterator[None]:
+    """Apply the executor's stop words to the LLM for the duration of one call.
+
+    Uses :func:`shards_ai_agents.llms.base_llm.call_stop_override` so the LLM's stop
+    field is never mutated. Safe under concurrent execution: the override is
+    propagated via a :class:`contextvars.ContextVar` and is scoped to this
+    call's task / thread context.
+    """
+    extra = _executor_stop_words(executor_context)
+    if not extra or not isinstance(llm, BaseLLM) or set(extra).issubset(llm.stop):
+        yield
+        return
+    with call_stop_override(llm, list(set(llm.stop + extra))):
+        yield
+
+
+def has_reached_max_iterations(iterations: int, max_iterations: int) -> bool:
+    """Check if the maximum number of iterations has been reached.
+
+    Args:
+        iterations: Current number of iterations.
+        max_iterations: Maximum allowed iterations.
+
+    Returns:
+        True if maximum iterations reached, False otherwise.
+    """
+    return iterations >= max_iterations
+
+
+def handle_max_iterations_exceeded(
+    printer: Printer,
+    messages: list[LLMMessage],
+    llm: LLM | BaseLLM,
+    callbacks: list[TokenCalcHandler],
+    verbose: bool = True,
+) -> AgentFinish:
+    """Handles the case when the maximum number of iterations is exceeded. Performs one more LLM call to get the final answer.
+
+    Args:
+        printer: Printer instance for output.
+        messages: Conversation so far; the forced-answer instruction is appended
+            to it as a user turn.
+        llm: The LLM instance to call.
+        callbacks: List of callbacks for the LLM call.
+        verbose: Whether to print output.
+
+    Returns:
+        AgentFinish with the final answer after exceeding max iterations.
+    """
+    if verbose:
+        printer.print(
+            content="Maximum iterations reached. Requesting final answer.",
+            color="yellow",
+        )
+
+    # A trailing assistant turn is a prefill request, which current Claude
+    # models reject with a 400; every provider accepts a trailing user turn.
+    messages.append(
+        format_message_for_llm(I18N_DEFAULT.errors("force_final_answer"), role="user")
+    )
+
+    answer = llm.call(
+        messages,
+        callbacks=callbacks,
+    )
+
+    if answer is None or answer == "":
+        if verbose:
+            printer.print(
+                content="Received None or empty response from LLM call.",
+                color="red",
+            )
+        raise ValueError("Invalid response from LLM call - None or empty.")
+
+    formatted = format_answer(answer=answer)
+
+    if isinstance(formatted, AgentFinish):
+        return formatted
+    return AgentFinish(
+        thought=formatted.thought,
+        output=formatted.text,
+        text=formatted.text,
+    )
+
+
+def format_answer(answer: str) -> AgentAction | AgentFinish:
+    """Format a response from the LLM into an AgentAction or AgentFinish.
+
+    Args:
+        answer: The raw response from the LLM
+
+    Returns:
+        Either an AgentAction or AgentFinish
+    """
+    try:
+        return parse(answer)
+    except Exception:
+        return AgentFinish(
+            thought="Failed to parse LLM response",
+            output=answer,
+            text=answer,
+        )
+
+
+def enforce_rpm_limit(
+    request_within_rpm_limit: Callable[[], bool] | None = None,
+) -> None:
+    """Enforce the requests per minute (RPM) limit if applicable.
+
+    Args:
+        request_within_rpm_limit: Function to enforce RPM limit.
+    """
+    if request_within_rpm_limit:
+        request_within_rpm_limit()
+
+
+@contextlib.contextmanager
+def _prepare_llm_call(
+    executor_context: AgentExecutor | LiteAgent | None,
+    messages: list[LLMMessage],
+    printer: Printer,
+    verbose: bool = True,
+) -> Iterator[list[LLMMessage]]:
+    """Shared pre-call logic: run before hooks and resolve messages.
+
+    Yields for the duration of the LLM call so the LLM layer knows the hooks
+    already ran with this executor's context and does not dispatch them twice.
+
+    Args:
+        executor_context: Optional executor context for hook invocation.
+        messages: The messages to send to the LLM.
+        printer: Printer instance for output.
+        verbose: Whether to print output.
+
+    Yields:
+        The resolved messages list (may come from executor_context).
+
+    Raises:
+        ValueError: If a before hook blocks the call.
+    """
+    from shards_ai_agents.hooks.llm_hooks import model_call_hooks_dispatched
+
+    if executor_context is None:
+        yield messages
+        return
+
+    if not _setup_before_llm_call_hooks(executor_context, printer, verbose=verbose):
+        raise LLMCallBlockedError("LLM call blocked by before_llm_call hook")
+
+    with model_call_hooks_dispatched():
+        yield executor_context.messages
+
+
+def _validate_and_finalize_llm_response(
+    answer: Any,
+    executor_context: AgentExecutor | LiteAgent | None,
+    printer: Printer,
+    verbose: bool = True,
+) -> str | BaseModel | Any:
+    """Shared post-call logic: validate response and run after hooks.
+
+    Args:
+        answer: The raw LLM response.
+        executor_context: Optional executor context for hook invocation.
+        printer: Printer instance for output.
+        verbose: Whether to print output.
+
+    Returns:
+        The potentially modified response.
+
+    Raises:
+        ValueError: If the response is None or empty.
+    """
+    if not answer:
+        if verbose:
+            printer.print(
+                content="Received None or empty response from LLM call.",
+                color="red",
+            )
+        raise ValueError("Invalid response from LLM call - None or empty.")
+
+    return _setup_after_llm_call_hooks(
+        executor_context, answer, printer, verbose=verbose
+    )
+
+
+def _summarize_context_before_llm_call(
+    llm: LLM | BaseLLM,
+    messages: list[LLMMessage],
+    callbacks: list[TokenCalcHandler],
+    printer: Printer,
+    verbose: bool,
+    from_task: Task | None = None,
+    from_agent: BaseAgent | None = None,
+    *,
+    allow_single_user_compaction: bool = False,
+) -> None:
+    """Compact messages after a context-window check.
+
+    Conversational callers allow a single user message because the router
+    serializes its entire context into one message. Agent callers preserve
+    their existing single-request behavior.
+    """
+    non_system_messages = [
+        message for message in messages if message.get("role") != "system"
+    ]
+    if (
+        not allow_single_user_compaction
+        and len(non_system_messages) == 1
+        and non_system_messages[0].get("role") == "user"
+    ):
+        return
+
+    model = getattr(llm, "model", None)
+    if not isinstance(model, str):
+        model = None
+
+    tokens_before = llm.get_input_tokens_count(messages) if verbose else 0
+    shards_ai_agents_event_bus.emit(
+        llm,
+        event=ContextWindowSummarizationStartedEvent(
+            from_task=from_task,
+            from_agent=from_agent,
+            model=model,
+        ),
+    )
+    if verbose:
+        console.print(
+            Panel(
+                "The pending request is nearing the model context limit. "
+                "Compacting the conversation before the next model call.\n\n"
+                f"Context: {tokens_before:,} tokens before compaction.",
+                title="🧠 Context summarization triggered",
+                border_style="yellow",
+                padding=(1, 2),
+            )
+        )
+    try:
+        llm.summarize_messages(messages, callbacks, verbose)
+    except Exception as error:
+        shards_ai_agents_event_bus.emit(
+            llm,
+            event=ContextWindowSummarizationFailedEvent(
+                from_task=from_task,
+                from_agent=from_agent,
+                model=model,
+                error=str(error),
+            ),
+        )
+        if verbose:
+            console.print(
+                Panel(
+                    "Conversation context could not be compacted. Continuing with the original request.",
+                    title="⚠️ Context summarization failed",
+                    border_style="red",
+                    padding=(1, 2),
+                )
+            )
+        raise
+    shards_ai_agents_event_bus.emit(
+        llm,
+        event=ContextWindowSummarizationCompletedEvent(
+            from_task=from_task,
+            from_agent=from_agent,
+            model=model,
+        ),
+    )
+    if verbose:
+        tokens_after = llm.get_input_tokens_count(messages)
+        reduction = (
+            ((tokens_before - tokens_after) / tokens_before * 100)
+            if tokens_before
+            else 0
+        )
+        console.print(
+            Panel(
+                "Conversation context has been compacted and is ready for the next model call.\n\n"
+                f"Context: {tokens_before:,} → {tokens_after:,} tokens "
+                f"({reduction:.1f}% reduction).",
+                title="✅ Context summarization completed",
+                border_style="green",
+                padding=(1, 2),
+            )
+        )
+
+
+def _proactively_summarize_context(
+    llm: LLM | BaseLLM,
+    messages: list[LLMMessage],
+    callbacks: list[TokenCalcHandler],
+    printer: Printer,
+    tools: list[dict[str, Any]] | None,
+    response_model: type[BaseModel] | None,
+    verbose: bool,
+    from_task: Task | None = None,
+    from_agent: BaseAgent | None = None,
+    *,
+    allow_single_user_compaction: bool = False,
+) -> None:
+    """Try to summarize oversized context without blocking a valid LLM call."""
+    try:
+        if llm.is_context_window_overflowing_threshold(messages, tools, response_model):
+            _summarize_context_before_llm_call(
+                llm=llm,
+                messages=messages,
+                callbacks=callbacks,
+                printer=printer,
+                verbose=verbose,
+                from_task=from_task,
+                from_agent=from_agent,
+                allow_single_user_compaction=allow_single_user_compaction,
+            )
+    except (HookAborted, LLMCallBlockedError):
+        raise
+    except Exception:
+        logger.debug(
+            "Proactive context preflight or summarization failed; continuing with the LLM call.",
+            exc_info=True,
+        )
+
+
+def get_llm_response(
+    llm: LLM | BaseLLM,
+    messages: list[LLMMessage],
+    callbacks: list[TokenCalcHandler],
+    printer: Printer,
+    tools: list[dict[str, Any]] | None = None,
+    available_functions: dict[str, Callable[..., Any]] | None = None,
+    from_task: Task | None = None,
+    from_agent: BaseAgent | None = None,
+    response_model: type[BaseModel] | None = None,
+    executor_context: AgentExecutor | LiteAgent | None = None,
+    verbose: bool = True,
+) -> str | BaseModel | Any:
+    """Call the LLM and return the response, handling any invalid responses.
+
+    Args:
+        llm: The LLM instance to call.
+        messages: The messages to send to the LLM.
+        callbacks: List of callbacks for the LLM call.
+        printer: Printer instance for output.
+        tools: Optional list of tool schemas for native function calling.
+        available_functions: Optional dict mapping function names to callables.
+        from_task: Optional task context for the LLM call.
+        from_agent: Optional agent context for the LLM call.
+        response_model: Optional Pydantic model for structured outputs.
+        executor_context: Optional executor context for hook invocation.
+        verbose: Whether to print output.
+
+    Returns:
+        The response from the LLM as a string, Pydantic model (when response_model is provided),
+        or tool call results if native function calling is used.
+
+    Raises:
+        Exception: If an error occurs.
+        ValueError: If the response is None or empty.
+    """
+    with _prepare_llm_call(
+        executor_context, messages, printer, verbose=verbose
+    ) as prepared_messages:
+        if getattr(executor_context, "respect_context_window", False):
+            _proactively_summarize_context(
+                llm=llm,
+                messages=prepared_messages,
+                callbacks=callbacks,
+                printer=printer,
+                tools=tools,
+                response_model=response_model,
+                verbose=verbose,
+                from_task=from_task,
+                from_agent=from_agent,
+            )
+        answer = llm.call(
+            prepared_messages,
+            tools=tools,
+            callbacks=callbacks,
+            available_functions=available_functions,
+            from_task=from_task,
+            from_agent=from_agent,
+            response_model=response_model,
+        )
+
+    return _validate_and_finalize_llm_response(
+        answer, executor_context, printer, verbose=verbose
+    )
+
+
+async def aget_llm_response(
+    llm: LLM | BaseLLM,
+    messages: list[LLMMessage],
+    callbacks: list[TokenCalcHandler],
+    printer: Printer,
+    tools: list[dict[str, Any]] | None = None,
+    available_functions: dict[str, Callable[..., Any]] | None = None,
+    from_task: Task | None = None,
+    from_agent: BaseAgent | None = None,
+    response_model: type[BaseModel] | None = None,
+    executor_context: AgentExecutor | None = None,
+    verbose: bool = True,
+) -> str | BaseModel | Any:
+    """Call the LLM asynchronously and return the response.
+
+    Args:
+        llm: The LLM instance to call.
+        messages: The messages to send to the LLM.
+        callbacks: List of callbacks for the LLM call.
+        printer: Printer instance for output.
+        tools: Optional list of tool schemas for native function calling.
+        available_functions: Optional dict mapping function names to callables.
+        from_task: Optional task context for the LLM call.
+        from_agent: Optional agent context for the LLM call.
+        response_model: Optional Pydantic model for structured outputs.
+        executor_context: Optional executor context for hook invocation.
+        verbose: Whether to print output.
+
+    Returns:
+        The response from the LLM as a string, Pydantic model (when response_model is provided),
+        or tool call results if native function calling is used.
+
+    Raises:
+        Exception: If an error occurs.
+        ValueError: If the response is None or empty.
+    """
+    with _prepare_llm_call(
+        executor_context, messages, printer, verbose=verbose
+    ) as prepared_messages:
+        if getattr(executor_context, "respect_context_window", False):
+            await asyncio.to_thread(
+                _proactively_summarize_context,
+                llm=llm,
+                messages=prepared_messages,
+                callbacks=callbacks,
+                printer=printer,
+                tools=tools,
+                response_model=response_model,
+                verbose=verbose,
+                from_task=from_task,
+                from_agent=from_agent,
+            )
+        answer = await llm.acall(
+            prepared_messages,
+            tools=tools,
+            callbacks=callbacks,
+            available_functions=available_functions,
+            from_task=from_task,
+            from_agent=from_agent,
+            response_model=response_model,
+        )
+
+    return _validate_and_finalize_llm_response(
+        answer, executor_context, printer, verbose=verbose
+    )
+
+
+def process_llm_response(
+    answer: str, use_stop_words: bool
+) -> AgentAction | AgentFinish:
+    """Process the LLM response and format it into an AgentAction or AgentFinish.
+
+    Args:
+        answer: The raw response from the LLM
+        use_stop_words: Whether to use stop words in the LLM call
+
+    Returns:
+        Either an AgentAction or AgentFinish
+    """
+    if not use_stop_words:
+        try:
+            format_answer(answer)
+        except OutputParserError as e:
+            if FINAL_ANSWER_AND_PARSABLE_ACTION_ERROR_MESSAGE in e.error:
+                answer = answer.split("Observation:")[0].strip()
+
+    return format_answer(answer)
+
+
+def handle_agent_action_core(
+    formatted_answer: AgentAction,
+    tool_result: ToolResult,
+    messages: list[LLMMessage] | None = None,
+    step_callback: Callable | None = None,  # type: ignore[type-arg]
+    show_logs: Callable | None = None,  # type: ignore[type-arg]
+) -> AgentAction | AgentFinish:
+    """Core logic for handling agent actions and tool results.
+
+    Args:
+        formatted_answer: The agent's action
+        tool_result: The result of executing the tool
+        messages: Optional list of messages to append results to
+        step_callback: Optional callback to execute after processing
+        show_logs: Optional function to show logs
+
+    Returns:
+        Either an AgentAction or AgentFinish
+
+    Notes:
+        - TODO: Remove messages parameter and its usage.
+    """
+    if step_callback:
+        cb_result = step_callback(tool_result)
+        if inspect.iscoroutine(cb_result):
+            asyncio.run(cb_result)
+
+    formatted_answer.text += f"\nObservation: {tool_result.result}"
+    formatted_answer.result = tool_result.result
+
+    if tool_result.result_as_answer:
+        return AgentFinish(
+            thought="",
+            output=tool_result.result,
+            text=formatted_answer.text,
+        )
+
+    if show_logs:
+        show_logs(formatted_answer)
+
+    return formatted_answer
+
+
+def handle_unknown_error(
+    printer: Printer, exception: Exception, verbose: bool = True
+) -> None:
+    """Handle unknown errors by informing the user.
+
+    Args:
+        printer: Printer instance for output
+        exception: The exception that occurred
+        verbose: Whether to print output.
+    """
+    if not verbose:
+        return
+
+    error_message = str(exception)
+
+    if "litellm" in error_message:
+        return
+
+    printer.print(
+        content="An unknown error occurred. Please check the details below.",
+        color="red",
+    )
+    printer.print(
+        content=f"Error details: {error_message}",
+        color="red",
+    )
+
+
+def handle_output_parser_exception(
+    e: OutputParserError,
+    messages: list[LLMMessage],
+    iterations: int,
+    log_error_after: int = 3,
+    printer: Printer | None = None,
+    verbose: bool = True,
+) -> AgentAction:
+    """Handle OutputParserError by updating messages and formatted_answer.
+
+    Args:
+        e: The OutputParserError that occurred
+        messages: List of messages to append to
+        iterations: Current iteration count
+        log_error_after: Number of iterations after which to log errors
+        printer: Optional printer instance for logging
+
+    Returns:
+        AgentAction: A formatted answer with the error
+    """
+    messages.append({"role": "user", "content": e.error})
+
+    formatted_answer = AgentAction(
+        text=e.error,
+        tool="",
+        tool_input="",
+        thought="",
+    )
+
+    if verbose and iterations > log_error_after and printer:
+        printer.print(
+            content=f"Error parsing LLM output, agent will retry: {e.error}",
+            color="red",
+        )
+
+    return formatted_answer
+
+
+def is_context_length_exceeded(exception: Exception) -> bool:
+    """Check if the exception is due to context length exceeding.
+
+    Args:
+        exception: The exception to check
+
+    Returns:
+        bool: True if the exception is due to context length exceeding
+    """
+    return LLMContextLengthExceededError(
+        str(exception)
+    )._is_context_length_exceeded_error(exception)
+
+
+def handle_context_length(
+    respect_context_window: bool,
+    printer: Printer,
+    messages: list[LLMMessage],
+    llm: LLM | BaseLLM,
+    callbacks: list[TokenCalcHandler],
+    verbose: bool = True,
+) -> None:
+    """Handle context length exceeded by either summarizing or raising an error.
+
+    Args:
+        respect_context_window: Whether to respect context window
+        printer: Printer instance for output
+        messages: List of messages to summarize
+        llm: LLM instance for summarization
+        callbacks: List of callbacks for LLM
+
+    Raises:
+        SystemExit: If context length is exceeded and user opts not to summarize
+    """
+    if respect_context_window:
+        if verbose:
+            printer.print(
+                content="Context length exceeded. Summarizing content to fit the model context window. Might take a while...",
+                color="yellow",
+            )
+        llm.summarize_messages(messages, callbacks, verbose)
+    else:
+        if verbose:
+            printer.print(
+                content="Context length exceeded. Consider using smaller text or RAG tools from shards_ai_agents_tools.",
+                color="red",
+            )
+        raise SystemExit(
+            "Context length exceeded and user opted not to summarize. Consider using smaller text or RAG tools from shards_ai_agents_tools."
+        )
+
+
+def show_agent_logs(
+    printer: Printer,
+    agent_role: str,
+    formatted_answer: AgentAction | AgentFinish | None = None,
+    task_description: str | None = None,
+    verbose: bool = False,
+) -> None:
+    """Show agent logs for both start and execution states.
+
+    Args:
+        printer: Printer instance for output
+        agent_role: Role of the agent
+        formatted_answer: Optional AgentAction or AgentFinish for execution logs
+        task_description: Optional task description for start logs
+        verbose: Whether to show verbose output
+    """
+    if not verbose:
+        return
+
+    agent_role = agent_role.partition("\n")[0]
+
+    if formatted_answer is None:
+        printer.print(
+            content=[
+                ColoredText("# Agent: ", "bold_purple"),
+                ColoredText(agent_role, "bold_green"),
+            ]
+        )
+        if task_description:
+            printer.print(
+                content=[
+                    ColoredText("## Task: ", "purple"),
+                    ColoredText(task_description, "green"),
+                ]
+            )
+    else:
+        printer.print(
+            content=[
+                ColoredText("\n\n# Agent: ", "bold_purple"),
+                ColoredText(agent_role, "bold_green"),
+            ]
+        )
+
+        if isinstance(formatted_answer, AgentAction):
+            thought = _MULTIPLE_NEWLINES.sub("\n", formatted_answer.thought)
+            formatted_json = json.dumps(
+                formatted_answer.tool_input,
+                indent=2,
+                ensure_ascii=False,
+            )
+            if thought and thought != "":
+                printer.print(
+                    content=[
+                        ColoredText("## Thought: ", "purple"),
+                        ColoredText(thought, "green"),
+                    ]
+                )
+            printer.print(
+                content=[
+                    ColoredText("## Using tool: ", "purple"),
+                    ColoredText(formatted_answer.tool, "green"),
+                ]
+            )
+            printer.print(
+                content=[
+                    ColoredText("## Tool Input: ", "purple"),
+                    ColoredText(f"\n{formatted_json}", "green"),
+                ]
+            )
+            printer.print(
+                content=[
+                    ColoredText("## Tool Output: ", "purple"),
+                    ColoredText(f"\n{formatted_answer.result}", "green"),
+                ]
+            )
+        elif isinstance(formatted_answer, AgentFinish):
+            printer.print(
+                content=[
+                    ColoredText("## Final Answer: ", "purple"),
+                    ColoredText(f"\n{formatted_answer.output}\n\n", "green"),
+                ]
+            )
+
+
+def _print_current_organization() -> None:
+    settings = Settings()
+    if settings.org_uuid:
+        console.print(
+            f"Fetching agent from organization: {settings.org_name} ({settings.org_uuid})",
+            style="bold blue",
+        )
+    else:
+        console.print(
+            "No organization currently set. We recommend setting one before using: `shards-agents org switch <org_id>` command.",
+            style="yellow",
+        )
+
+
+def load_agent_from_repository(from_repository: str) -> dict[str, Any]:
+    """Load an agent from the repository.
+
+    Args:
+        from_repository: The name of the agent to load.
+
+    Returns:
+        A dictionary of attributes to use for the agent.
+
+    Raises:
+        AgentRepositoryError: If the agent cannot be loaded.
+    """
+    attributes: dict[str, Any] = {}
+    if from_repository:
+        import importlib
+
+        def build_default_client() -> Any:
+            from shards_ai_agents.auth.token import get_auth_token
+            from shards_ai_agents.plus_api import PlusAPI
+
+            return PlusAPI(api_key=get_auth_token())
+
+        client = resolve_plus_client(build_default_client)
+        _print_current_organization()
+        response = resolve_plus_response(client.get_agent(from_repository))
+        if response.status_code == 404:
+            raise AgentRepositoryError(
+                f"Agent {from_repository} does not exist, make sure the name is correct or the agent is available on your organization."
+                f"\nIf you are using the wrong organization, switch to the correct one using `shards-agents org switch <org_id>` command.",
+            )
+
+        if response.status_code != 200:
+            raise AgentRepositoryError(
+                f"Agent {from_repository} could not be loaded: {response.text}"
+                f"\nIf you are using the wrong organization, switch to the correct one using `shards-agents org switch <org_id>` command.",
+            )
+
+        agent = response.json()
+        skill_versions = agent.get("skill_versions") or []
+        for key, value in agent.items():
+            if value is None:
+                continue
+            if key == "skill_versions":
+                # Folded into the skill refs below, and not an Agent field.
+                continue
+            if key == "skills":
+                if not value:
+                    continue
+                attributes[key] = _pin_skill_refs(value, skill_versions)
+            elif key == "tools":
+                attributes[key] = []
+                for tool in value:
+                    try:
+                        module = importlib.import_module(tool["module"])
+                        tool_class = getattr(module, tool["name"])
+
+                        tool_value = tool_class(**tool["init_params"])
+
+                        if isinstance(tool_value, list):
+                            attributes[key].extend(tool_value)
+                        else:
+                            attributes[key].append(tool_value)
+
+                    except Exception as e:  # noqa: PERF203
+                        raise AgentRepositoryError(
+                            f"Tool {tool['name']} could not be loaded: {e}"
+                        ) from e
+            else:
+                attributes[key] = value
+    return attributes
+
+
+def _pin_skill_refs(refs: list[Any], skill_versions: list[dict[str, Any]]) -> list[Any]:
+    """Pin repository skill refs to the versions the repository recorded.
+
+    An agent's ``skills`` are plain ``@org/name`` refs while ``skill_versions``
+    carries the version pinned against each one. Without folding the two
+    together the runtime resolves whatever version is newest, so publishing a
+    new version of a skill would silently change every agent using it.
+
+    Args:
+        refs: Skill references as returned by the repository.
+        skill_versions: Repository version records, each with a ``registry_ref``
+            and ``version``.
+
+    Returns:
+        The refs, version-pinned where the repository recorded one.
+    """
+    pinned_versions = {
+        entry["registry_ref"]: entry["version"]
+        for entry in skill_versions
+        if isinstance(entry, dict)
+        and entry.get("registry_ref")
+        and entry.get("version")
+    }
+    if not pinned_versions:
+        return refs
+
+    pinned_refs: list[Any] = []
+    for ref in refs:
+        version = pinned_versions.get(ref) if isinstance(ref, str) else None
+        # Leave anything already pinned (a second '@') exactly as it is.
+        already_pinned = isinstance(ref, str) and "@" in ref[1:]
+        pinned_refs.append(
+            f"{ref}@{version}" if version and not already_pinned else ref
+        )
+    return pinned_refs
+
+
+DELEGATION_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+    [
+        sanitize_tool_name("Delegate work to coworker"),
+        sanitize_tool_name("Ask question to coworker"),
+    ]
+)
+
+
+def track_delegation_if_needed(
+    tool_name: str,
+    tool_args: dict[str, Any],
+    task: Task | None,
+) -> None:
+    """Track delegation if the tool is a delegation tool.
+
+    Args:
+        tool_name: Name of the tool being executed.
+        tool_args: Arguments passed to the tool.
+        task: The task being executed (used to track delegations).
+    """
+    if sanitize_tool_name(tool_name) in DELEGATION_TOOL_NAMES and task is not None:
+        coworker = tool_args.get("coworker")
+        task.increment_delegations(coworker)
+
+
+def extract_tool_call_info(
+    tool_call: Any,
+) -> tuple[str, str, dict[str, Any] | str] | None:
+    """Extract tool call ID, name, and arguments from various provider formats.
+
+    Args:
+        tool_call: The tool call object to extract info from.
+
+    Returns:
+        Tuple of (call_id, func_name, func_args) or None if format is unrecognized.
+    """
+    if hasattr(tool_call, "function"):
+        # OpenAI-style: has .function.name and .function.arguments
+        call_id = getattr(tool_call, "id", f"call_{id(tool_call)}")
+        return (
+            call_id,
+            sanitize_tool_name(tool_call.function.name),
+            tool_call.function.arguments,
+        )
+    if hasattr(tool_call, "function_call") and tool_call.function_call:
+        # Gemini-style: has .function_call.name and .function_call.args
+        call_id = f"call_{id(tool_call)}"
+        return (
+            call_id,
+            sanitize_tool_name(tool_call.function_call.name),
+            dict(tool_call.function_call.args) if tool_call.function_call.args else {},
+        )
+    if hasattr(tool_call, "name") and hasattr(tool_call, "input"):
+        # Anthropic format: has .name and .input (ToolUseBlock)
+        call_id = getattr(tool_call, "id", f"call_{id(tool_call)}")
+        return call_id, sanitize_tool_name(tool_call.name), tool_call.input
+    if isinstance(tool_call, dict):
+        # Prefer the Responses API "call_id", then OpenAI "id", then Bedrock
+        # "toolUseId", else generate one. A raw Responses function_call item carries
+        # both "id" (fc_...) and "call_id" (call_...) with different values, and the
+        # matching function_call_output must reference "call_id" -- reading "id"
+        # would produce a tool result that can't be correlated to its invocation.
+        call_id = (
+            tool_call.get("call_id")
+            or tool_call.get("id")
+            or tool_call.get("toolUseId")
+            or f"call_{id(tool_call)}"
+        )
+        func_info = tool_call.get("function", {})
+        func_name = func_info.get("name", "") or tool_call.get("name", "")
+        # "arguments" is also read from the top level for the OpenAI Responses API,
+        # which emits {"id", "name", "arguments"} with no nested "function" object.
+        # Without it the args silently resolved to {} and the tool ran with no input.
+        func_args = (
+            func_info.get("arguments")
+            or tool_call.get("arguments")
+            or tool_call.get("input")
+            or {}
+        )
+        return call_id, sanitize_tool_name(func_name), func_args
+    return None
+
+
+def is_tool_call_list(response: list[Any]) -> bool:
+    """Check if a response from the LLM is a list of tool calls.
+
+    Supports OpenAI, Anthropic, Bedrock, and Gemini formats.
+
+    Args:
+        response: The response to check.
+
+    Returns:
+        True if the response appears to be a list of tool calls.
+    """
+    if not response:
+        return False
+    first_item = response[0]
+    # OpenAI-style
+    if hasattr(first_item, "function") or (
+        isinstance(first_item, dict) and "function" in first_item
+    ):
+        return True
+    # Anthropic-style (ToolUseBlock)
+    if hasattr(first_item, "type") and getattr(first_item, "type", None) == "tool_use":
+        return True
+    if hasattr(first_item, "name") and hasattr(first_item, "input"):
+        return True
+    # Bedrock-style
+    if isinstance(first_item, dict) and "name" in first_item and "input" in first_item:
+        return True
+    # OpenAI Responses API style: {"id", "name", "arguments"}, with no nested
+    # "function" object and no "input". This intentionally accepts the same broad
+    # shape as the Bedrock check above; only provider paths that return lists reach
+    # this classifier.
+    if (
+        isinstance(first_item, dict)
+        and "name" in first_item
+        and "arguments" in first_item
+    ):
+        return True
+    # Gemini-style
+    if hasattr(first_item, "function_call") and first_item.function_call:
+        return True
+    return False
+
+
+def check_native_tool_support(llm: Any, original_tools: list[BaseTool] | None) -> bool:
+    """Check if the LLM supports native function calling and tools are available.
+
+    Args:
+        llm: The LLM instance.
+        original_tools: Original BaseTool instances.
+
+    Returns:
+        True if native function calling is supported and tools exist.
+    """
+    return (
+        hasattr(llm, "supports_function_calling")
+        and callable(getattr(llm, "supports_function_calling", None))
+        and llm.supports_function_calling()
+        and bool(original_tools)
+    )
+
+
+def is_native_tool_calling_unsupported_error(error: BaseException) -> bool:
+    """Return whether an error means native tool calling is unavailable."""
+    message = str(error).lower()
+    return any(pattern in message for pattern in _NATIVE_TOOL_UNSUPPORTED_PATTERNS)
+
+
+def build_text_tool_calling_fallback_message(
+    tools_description: str,
+    tools_names: str,
+) -> str:
+    """Build instructions for downgrading native tools to text tool calls."""
+    text_tooling_prompt = I18N_DEFAULT.slice("tools").format(
+        tools=tools_description,
+        tool_names=tools_names,
+    )
+    return (
+        "Native tool calling is unavailable for this model/provider. "
+        "Continue using Shards-ai-agents text tool calling instead.\n"
+        f"{text_tooling_prompt}"
+    )
+
+
+def setup_native_tools(
+    original_tools: list[BaseTool],
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, Callable[..., Any]],
+    dict[str, BaseTool | CrewStructuredTool],
+]:
+    """Convert tools to OpenAI schema format for native function calling.
+
+    Args:
+        original_tools: Original BaseTool instances.
+
+    Returns:
+        Tuple of (openai_tools_schema, available_functions_dict, tool_name_mapping).
+    """
+    return convert_tools_to_openai_schema(original_tools)
+
+
+def build_tool_calls_assistant_message(
+    tool_calls: list[Any],
+) -> tuple[LLMMessage | None, list[dict[str, Any]]]:
+    """Build an assistant message containing tool call reports.
+
+    Extracts info from each tool call, builds the standard assistant message
+    format, and preserves raw Gemini parts when applicable.
+
+    Args:
+        tool_calls: Raw tool call objects from the LLM response.
+
+    Returns:
+        Tuple of (assistant_message, tool_calls_to_report).
+        assistant_message is None if no valid tool calls found.
+    """
+    tool_calls_to_report: list[dict[str, Any]] = []
+    for tool_call in tool_calls:
+        info = extract_tool_call_info(tool_call)
+        if not info:
+            continue
+        call_id, func_name, func_args = info
+        tool_calls_to_report.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": func_name,
+                    "arguments": func_args
+                    if isinstance(func_args, str)
+                    else json.dumps(func_args),
+                },
+            }
+        )
+
+    if not tool_calls_to_report:
+        return None, []
+
+    assistant_message: LLMMessage = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": tool_calls_to_report,
+    }
+    # Preserve raw parts for Gemini compatibility
+    if all(type(tc).__qualname__ == "Part" for tc in tool_calls):
+        assistant_message["raw_tool_call_parts"] = list(tool_calls)
+
+    return assistant_message, tool_calls_to_report
+
+
+@dataclass
+class NativeToolCallResult:
+    """Result from executing a single native tool call."""
+
+    call_id: str
+    func_name: str
+    result: str
+    from_cache: bool = False
+    result_as_answer: bool = False
+    tool_message: LLMMessage = field(default_factory=dict)  # type: ignore[assignment]
+
+
+def format_native_tool_output_for_agent(tool: Any, raw_result: Any) -> str:
+    """Format native tool output when a tool explicitly defines a formatter."""
+    if isinstance(raw_result, ToolFailure):
+        return raw_result.as_agent_message()
+
+    formatter = inspect.getattr_static(tool, "format_output_for_agent", None)
+    if formatter is None:
+        return str(raw_result)
+
+    runtime_formatter = getattr(tool, "format_output_for_agent", None)
+    if not callable(runtime_formatter):
+        return str(raw_result)
+
+    return str(runtime_formatter(raw_result))
+
+
+def execute_single_native_tool_call(
+    tool_call: Any,
+    *,
+    available_functions: dict[str, Callable[..., Any]],
+    original_tools: list[BaseTool],
+    structured_tools: list[CrewStructuredTool] | None,
+    tools_handler: ToolsHandler | None,
+    agent: BaseAgent | None,
+    task: Task | None,
+    crew: Any | None,
+    event_source: Any,
+    printer: Printer | None = None,
+    verbose: bool = False,
+    plan_step_number: int | None = None,
+    plan_step_description: str | None = None,
+) -> NativeToolCallResult:
+    """Execute a single native tool call with full lifecycle management.
+
+    Handles: arg parsing, tool lookup, max-usage check, cache read/write,
+    before/after hooks, event emission, and result_as_answer detection.
+
+    Args:
+        tool_call: Raw tool call object from the LLM.
+        available_functions: Map of sanitized tool name -> callable.
+        original_tools: Original BaseTool list (for cache_function, result_as_answer).
+        structured_tools: Structured tools list (for hook context).
+        tools_handler: Optional handler with cache.
+        agent: The agent instance.
+        task: The current task.
+        crew: The crew instance.
+        event_source: The object to use as event emitter source.
+        printer: Optional printer for verbose logging.
+        verbose: Whether to print verbose output.
+
+    Returns:
+        NativeToolCallResult with all execution details.
+    """
+    from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+    from shards_ai_agents.events.types.tool_usage_events import (
+        ToolUsageErrorEvent,
+        ToolUsageFinishedEvent,
+        ToolUsageStartedEvent,
+    )
+    from shards_ai_agents.hooks.tool_hooks import (
+        ToolCallHookContext,
+        run_after_tool_call_hooks,
+        run_before_tool_call_hooks,
+    )
+
+    info = extract_tool_call_info(tool_call)
+    if not info:
+        return NativeToolCallResult(
+            call_id="", func_name="", result="Unrecognized tool call format"
+        )
+
+    call_id, func_name, func_args = info
+
+    parsed_args, parse_error = parse_tool_call_args(func_args, func_name, call_id)
+    if parse_error is not None:
+        # Previously the decode error was swallowed into empty args and the tool
+        # ran with no input at all.
+        handle_tool_failure(
+            parse_error["tool_failure"],
+            tool_name=func_name,
+            tool_args=func_args,
+            agent=agent,
+            task=task,
+            crew=crew,
+        )
+        return NativeToolCallResult(
+            call_id=call_id,
+            func_name=func_name,
+            result=parse_error["result"],
+            tool_message={
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": func_name,
+                "content": parse_error["result"],
+            },
+        )
+    args_dict = parsed_args if parsed_args is not None else {}
+
+    agent_key = getattr(agent, "key", "unknown") if agent else "unknown"
+
+    original_tool: BaseTool | None = None
+    for tool in original_tools:
+        if sanitize_tool_name(tool.name) == func_name:
+            original_tool = tool
+            break
+
+    structured_tool: CrewStructuredTool | None = None
+    for structured in structured_tools or []:
+        if sanitize_tool_name(structured.name) == func_name:
+            structured_tool = structured
+            break
+
+    output_tool = original_tool or structured_tool
+
+    from_cache = False
+    result = "Tool not found"
+    raw_tool_result: Any = result
+    tool_failure: ToolFailure | None = None
+
+    started_at = datetime.now()
+    shards_ai_agents_event_bus.emit(
+        event_source,
+        event=ToolUsageStartedEvent(
+            tool_name=func_name,
+            tool_args=args_dict,
+            from_agent=agent,
+            from_task=task,
+            agent_key=agent_key,
+            plan_step_number=plan_step_number,
+            plan_step_description=plan_step_description,
+        ),
+    )
+
+    track_delegation_if_needed(func_name, args_dict, task)
+
+    before_hook_context = ToolCallHookContext(
+        tool_name=func_name,
+        tool_input=args_dict,
+        tool=structured_tool,  # type: ignore[arg-type]
+        agent=agent,
+        task=task,
+        crew=crew,
+    )
+    hook_blocked = run_before_tool_call_hooks(before_hook_context)
+
+    input_str = json.dumps(args_dict) if args_dict else ""
+    if (
+        not hook_blocked
+        and tools_handler
+        and tools_handler.cache
+        and output_tool is not None
+    ):
+        cached_result = tools_handler.cache.read(tool=func_name, input=input_str)
+        if cached_result is not None:
+            raw_tool_result = cached_result
+            result = format_native_tool_output_for_agent(output_tool, cached_result)
+            tool_failure = detect_tool_failure(cached_result)
+            from_cache = True
+
+    error_event_emitted = False
+    if hook_blocked:
+        result = f"Tool execution blocked by hook. Tool: {func_name}"
+        raw_tool_result = result
+        tool_failure = None
+    elif not from_cache:
+        if func_name in available_functions and output_tool is not None:
+            try:
+                tool_func = available_functions[func_name]
+                raw_result = tool_func(**args_dict)
+                raw_tool_result = raw_result
+
+                if tools_handler and tools_handler.cache:
+                    should_cache = True
+                    if original_tool:
+                        should_cache = original_tool.cache_function(
+                            args_dict, raw_result
+                        )
+                    if should_cache:
+                        tools_handler.cache.add(
+                            tool=func_name, input=input_str, output=raw_result
+                        )
+
+                result = format_native_tool_output_for_agent(output_tool, raw_result)
+                tool_failure = detect_tool_failure(raw_result)
+            except Exception as e:
+                result = f"Error executing tool: {e}"
+                raw_tool_result = result
+                tool_failure = failure_from_exception(e)
+                if task:
+                    task.increment_tools_errors()
+                shards_ai_agents_event_bus.emit(
+                    event_source,
+                    event=ToolUsageErrorEvent(
+                        tool_name=func_name,
+                        tool_args=args_dict,
+                        from_agent=agent,
+                        from_task=task,
+                        agent_key=agent_key,
+                        plan_step_number=plan_step_number,
+                        plan_step_description=plan_step_description,
+                        error=e,
+                    ),
+                )
+                error_event_emitted = True
+        else:
+            # Not cached and not executable: the model asked for a tool we do
+            # not have. The ReAct path reports this, so this one must too.
+            tool_failure = ToolFailure(
+                message=result,
+                reason=ToolFailureReason.UNKNOWN_TOOL,
+                code=func_name,
+            )
+
+    after_hook_context = ToolCallHookContext(
+        tool_name=func_name,
+        tool_input=args_dict,
+        tool=structured_tool,  # type: ignore[arg-type]
+        agent=agent,
+        task=task,
+        crew=crew,
+        tool_result=result,
+        raw_tool_result=raw_tool_result,
+    )
+    modified_result = run_after_tool_call_hooks(after_hook_context)
+    if modified_result is not None:
+        result = modified_result
+
+    if not error_event_emitted:
+        shards_ai_agents_event_bus.emit(
+            event_source,
+            event=ToolUsageFinishedEvent(
+                output=result,
+                tool_name=func_name,
+                tool_args=args_dict,
+                from_agent=agent,
+                from_task=task,
+                agent_key=agent_key,
+                plan_step_number=plan_step_number,
+                plan_step_description=plan_step_description,
+                started_at=started_at,
+                finished_at=datetime.now(),
+                failure=reportable_failure(
+                    tool_failure,
+                    tool=structured_tool,
+                    agent=agent,
+                    task=task,
+                    crew=crew,
+                ),
+            ),
+        )
+
+    # After the finished event, so subscribers see the full lifecycle even
+    # when the policy aborts.
+    if tool_failure is not None:
+        handle_tool_failure(
+            tool_failure,
+            tool_name=func_name,
+            tool_args=args_dict,
+            tool=structured_tool,
+            agent=agent,
+            task=task,
+            crew=crew,
+        )
+
+    tool_message: LLMMessage = {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "name": func_name,
+        "content": result,
+    }
+
+    is_result_as_answer = bool(
+        original_tool
+        and hasattr(original_tool, "result_as_answer")
+        and original_tool.result_as_answer
+        and not error_event_emitted
+        and not hook_blocked
+        # A declared failure is excluded for the same reason a raised one is:
+        # an error must not silently become the task's answer.
+        and tool_failure is None
+    )
+
+    return NativeToolCallResult(
+        call_id=call_id,
+        func_name=func_name,
+        result=result,
+        from_cache=from_cache,
+        result_as_answer=is_result_as_answer,
+        tool_message=tool_message,
+    )
+
+
+def parse_tool_call_args(
+    func_args: dict[str, Any] | str,
+    func_name: str,
+    call_id: str,
+    original_tool: Any = None,
+) -> tuple[dict[str, Any], None] | tuple[None, dict[str, Any]]:
+    """Parse tool call arguments from a JSON string or dict.
+
+    Returns:
+        ``(args_dict, None)`` on success, or ``(None, error_result)`` on
+        JSON parse failure where ``error_result`` is a ready-to-return dict
+        with the same shape as ``_execute_single_native_tool_call`` return
+        values, carrying an ``INVALID_INPUT`` failure for the caller to report.
+    """
+    if isinstance(func_args, str):
+        try:
+            return json.loads(func_args), None
+        except json.JSONDecodeError as e:
+            message = (
+                f"Error: Failed to parse tool arguments as JSON: {e}. "
+                f"Please provide valid JSON arguments for the '{func_name}' tool."
+            )
+            return None, {
+                "call_id": call_id,
+                "func_name": func_name,
+                "result": message,
+                "from_cache": False,
+                "original_tool": original_tool,
+                "tool_failure": ToolFailure(
+                    message=message,
+                    reason=ToolFailureReason.INVALID_INPUT,
+                    code="json_decode_error",
+                ),
+            }
+    return func_args, None
+
+
+def _setup_before_llm_call_hooks(
+    executor_context: AgentExecutor | LiteAgent | None,
+    printer: Printer,
+    verbose: bool = True,
+) -> bool:
+    """Setup and invoke before_llm_call hooks for the executor context.
+
+    Args:
+        executor_context: The executor context to setup the hooks for.
+        printer: Printer instance for error logging.
+        verbose: Whether to print output.
+
+    Returns:
+        True if LLM execution should proceed, False if a hook blocked it by
+        returning ``False``.
+
+    Raises:
+        HookAborted: If a hook raised it, so the deny reaches the caller intact.
+    """
+    if executor_context:
+        from shards_ai_agents.hooks.dispatch import (
+            InterceptionPoint,
+            get_scoped_hooks,
+            run_hooks,
+        )
+        from shards_ai_agents.hooks.llm_hooks import (
+            LLMCallHookContext,
+            LegacyHookBlocked,
+            before_llm_call_reducer,
+        )
+
+        # Executor snapshot first, then execution-scoped hooks — the same
+        # ordering dispatch() applies to global vs scoped hooks.
+        hooks: list[Any] = [
+            *executor_context.before_llm_call_hooks,
+            *get_scoped_hooks(InterceptionPoint.PRE_MODEL_CALL),
+        ]
+        if not hooks:
+            return True
+
+        original_messages = executor_context.messages
+
+        hook_context = LLMCallHookContext(executor_context)
+        try:
+            run_hooks(
+                InterceptionPoint.PRE_MODEL_CALL,
+                hook_context,
+                hooks,
+                reducer=before_llm_call_reducer,
+                verbose=verbose,
+            )
+        except LegacyHookBlocked:
+            if verbose:
+                printer.print(
+                    content="LLM call blocked by before_llm_call hook",
+                    color="yellow",
+                )
+            return False
+
+        if not isinstance(executor_context.messages, list):
+            if verbose:
+                printer.print(
+                    content=(
+                        "Warning: before_llm_call hook replaced messages with non-list. "
+                        "Restoring original messages list. Hooks should modify messages in-place, "
+                        "not replace the list (e.g., use context.messages.append() not context.messages = [])."
+                    ),
+                    color="yellow",
+                )
+            if isinstance(original_messages, list):
+                executor_context.messages = original_messages
+            else:
+                executor_context.messages = []
+
+    return True
+
+
+def _setup_after_llm_call_hooks(
+    executor_context: AgentExecutor | LiteAgent | None,
+    answer: str | BaseModel,
+    printer: Printer,
+    verbose: bool = True,
+) -> str | BaseModel:
+    """Setup and invoke after_llm_call hooks for the executor context.
+
+    Args:
+        executor_context: The executor context to setup the hooks for.
+        answer: The LLM response (string or Pydantic model).
+        printer: Printer instance for error logging.
+        verbose: Whether to print output.
+
+    Returns:
+        The potentially modified response (string or Pydantic model).
+    """
+    if executor_context:
+        from shards_ai_agents.hooks.dispatch import (
+            InterceptionPoint,
+            get_scoped_hooks,
+            run_hooks,
+        )
+        from shards_ai_agents.hooks.llm_hooks import (
+            LLMCallHookContext,
+            after_llm_call_reducer,
+        )
+
+        # Don't stringify structured tool-call payloads: the executor would
+        # treat the result as a final answer and skip tool execution (#6529).
+        # Hooks still run on the follow-up textual response.
+        if not isinstance(answer, (str, BaseModel)):
+            return answer
+
+        # Executor snapshot first, then execution-scoped hooks — the same
+        # ordering dispatch() applies to global vs scoped hooks.
+        hooks: list[Any] = [
+            *executor_context.after_llm_call_hooks,
+            *get_scoped_hooks(InterceptionPoint.POST_MODEL_CALL),
+        ]
+        if not hooks:
+            return answer
+
+        original_messages = executor_context.messages
+
+        if isinstance(answer, BaseModel):
+            pydantic_answer = answer
+            hook_response: str = pydantic_answer.model_dump_json()
+            original_json: str = hook_response
+        else:
+            pydantic_answer = None
+            hook_response = str(answer)
+
+        hook_context = LLMCallHookContext(executor_context, response=hook_response)
+        run_hooks(
+            InterceptionPoint.POST_MODEL_CALL,
+            hook_context,
+            hooks,
+            reducer=after_llm_call_reducer,
+            verbose=verbose,
+        )
+        if hook_context.response is not None:
+            hook_response = hook_context.response
+
+        if not isinstance(executor_context.messages, list):
+            if verbose:
+                printer.print(
+                    content=(
+                        "Warning: after_llm_call hook replaced messages with non-list. "
+                        "Restoring original messages list. Hooks should modify messages in-place, "
+                        "not replace the list (e.g., use context.messages.append() not context.messages = [])."
+                    ),
+                    color="yellow",
+                )
+            if isinstance(original_messages, list):
+                executor_context.messages = original_messages
+            else:
+                executor_context.messages = []
+
+        if pydantic_answer is not None:
+            if hook_response != original_json:
+                try:
+                    model_class: type[BaseModel] = type(pydantic_answer)
+                    answer = model_class.model_validate_json(hook_response)
+                except Exception as e:
+                    if verbose:
+                        printer.print(
+                            content=f"Warning: Hook modified response but failed to reparse as {type(pydantic_answer).__name__}: {e}. Using original model.",
+                            color="yellow",
+                        )
+        else:
+            answer = hook_response
+
+    return answer
+
+
+MAX_REPEATED_TOOL_CALLS = 5
+
+
+def check_repeated_tool_call(
+    counts: dict[int, int],
+    *,
+    tool_name: str,
+    tool_args: dict[str, Any] | str | None,
+    result: Any,
+    agent: BaseAgent | LiteAgent | None = None,
+    task: Task | None = None,
+) -> None:
+    """Stop a run that keeps repeating an identical tool call.
+
+    Args:
+        counts: Per-run tally of seen (tool, args, result) keys. Updated in place.
+        tool_name: Name of the tool that was called.
+        tool_args: Arguments the tool was called with.
+        result: What the tool returned.
+        agent: The calling agent, named in the error.
+        task: The task in flight, named in the error.
+
+    Raises:
+        ToolExecutionFailedError: On the MAX_REPEATED_TOOL_CALLS-th identical call.
+    """
+    key = hash(
+        json.dumps([tool_name, tool_args, str(result)], sort_keys=True, default=str)
+    )
+    counts[key] = counts.get(key, 0) + 1
+    if counts[key] < MAX_REPEATED_TOOL_CALLS:
+        return
+
+    role = getattr(agent, "role", None)
+    raise ToolExecutionFailedError(
+        ToolFailureRecord(
+            tool_name=tool_name,
+            failure=ToolFailure(
+                message=(
+                    f"Agent '{role}' called '{tool_name}' with the same "
+                    f"arguments {MAX_REPEATED_TOOL_CALLS} times and got the same "
+                    "result each time. Stopped because it is not making progress."
+                ),
+                reason=ToolFailureReason.REPEATED_CALL,
+            ),
+            tool_args=tool_args,
+            agent_role=role,
+            task_name=(task.name or task.description) if task else None,
+            task_id=str(task.id) if task else None,
+        )
+    )

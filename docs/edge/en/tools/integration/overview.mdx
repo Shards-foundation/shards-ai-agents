@@ -1,0 +1,76 @@
+---
+title: "Overview"
+description: "Connect Shards-ai-agents agents with external automations and managed AI services"
+icon: "face-smile"
+mode: "wide"
+---
+
+Integration tools let your agents hand off work to other automation platforms and managed AI services. Use them when a workflow needs to invoke an existing Shards-ai-agents deployment or delegate specialised tasks to providers such as Amazon Bedrock.
+
+## **Available Tools**
+
+<CardGroup cols={2}>
+  <Card title="Merge Agent Handler Tool" icon="diagram-project" href="/en/tools/integration/mergeagenthandlertool">
+    Securely access hundreds of third-party tools like Linear, GitHub, Slack, and more through Merge's unified API.
+  </Card>
+
+  <Card title="Shards-ai-agents Run Automation Tool" icon="robot" href="/en/tools/integration/shardsagentsautomationtool">
+    Invoke live Shards-ai-agents Platform automations, pass custom inputs, and poll for results directly from your agent.
+  </Card>
+
+  <Card title="Bedrock Invoke Agent Tool" icon="aws" href="/en/tools/integration/bedrockinvokeagenttool">
+    Call Amazon Bedrock Agents from your crews, reuse AWS guardrails, and stream responses back into the workflow.
+  </Card>
+</CardGroup>
+
+## **Common Use Cases**
+
+- **Chain automations**: Kick off an existing Shards-ai-agents deployment from within another crew or flow
+- **Enterprise hand-off**: Route tasks to Bedrock Agents that already encapsulate company logic and guardrails
+- **Hybrid workflows**: Combine Shards-ai-agents reasoning with downstream systems that expose their own agent APIs
+- **Long-running jobs**: Poll external automations and merge the final results back into the current run
+
+## **Quick Start Example**
+
+```python
+from shards_ai_agents import Agent, Task, Crew
+from shards_ai_agents_tools import InvokeShardsAgentsAutomationTool
+from shards_ai_agents_tools.aws.bedrock.agents.invoke_agent_tool import BedrockInvokeAgentTool
+
+# External automation
+analysis_automation = InvokeShardsAgentsAutomationTool(
+    crew_api_url="https://analysis-crew.acme.shards-ai-agents.invalid",
+    crew_bearer_token="YOUR_BEARER_TOKEN",
+    crew_name="Analysis Automation",
+    crew_description="Runs the production-grade analysis pipeline",
+)
+
+# Managed agent on Bedrock
+knowledge_router = BedrockInvokeAgentTool(
+    agent_id="bedrock-agent-id",
+    agent_alias_id="prod",
+)
+
+automation_strategist = Agent(
+    role="Automation Strategist",
+    goal="Orchestrate external automations and summarise their output",
+    backstory="You coordinate enterprise workflows and know when to delegate tasks to specialised services.",
+    tools=[analysis_automation, knowledge_router],
+    verbose=True,
+)
+
+execute_playbook = Task(
+    description="Run the analysis automation and ask the Bedrock agent for executive talking points.",
+    agent=automation_strategist,
+)
+
+Crew(agents=[automation_strategist], tasks=[execute_playbook]).kickoff()
+```
+
+## **Best Practices**
+
+- **Secure credentials**: Store API keys and bearer tokens in environment variables or a secrets manager
+- **Plan for latency**: External automations may take longer—set appropriate polling intervals and timeouts
+- **Reuse sessions**: Bedrock Agents support session IDs so you can maintain context across multiple tool calls
+- **Validate responses**: Normalise remote output (JSON, text, status codes) before forwarding it to downstream tasks
+- **Monitor usage**: Track audit logs in Shards-ai-agents Platform or AWS CloudWatch to stay ahead of quota limits and failures

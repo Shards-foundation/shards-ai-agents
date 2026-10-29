@@ -1,0 +1,1094 @@
+"""Tests for CheckpointConfig, checkpoint listener, pruning, and forking."""
+
+from __future__ import annotations
+
+import inspect
+from contextlib import closing
+import json
+import os
+import sqlite3
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+from pydantic import BaseModel
+
+from shards_ai_agents.agent.core import Agent
+from shards_ai_agents.agents.agent_builder.base_agent import BaseAgent
+from shards_ai_agents.crew import Crew
+from shards_ai_agents.llms.base_llm import BaseLLM
+from shards_ai_agents.flow.flow import _INITIAL_STATE_CLASS_MARKER, Flow, start
+from shards_ai_agents.state.checkpoint_config import CheckpointConfig
+from shards_ai_agents.state.checkpoint_listener import (
+    _find_checkpoint,
+    _resolve,
+    _SENTINEL,
+)
+from shards_ai_agents.state.provider.json_provider import JsonProvider
+from shards_ai_agents.state.provider.sqlite_provider import SqliteProvider
+from shards_ai_agents.state.runtime import RuntimeState
+from shards_ai_agents.task import Task
+from shards_ai_agents.tools.base_tool import BaseTool
+
+
+
+
+class TestResolve:
+    def test_none_returns_none(self) -> None:
+        assert _resolve(None) is None
+
+    def test_false_returns_sentinel(self) -> None:
+        assert _resolve(False) is _SENTINEL
+
+    def test_true_returns_config(self) -> None:
+        result = _resolve(True)
+        assert isinstance(result, CheckpointConfig)
+        assert result.location == "./.checkpoints"
+
+    def test_config_returns_config(self) -> None:
+        cfg = CheckpointConfig(location="/tmp/cp")
+        assert _resolve(cfg) is cfg
+
+
+
+
+class TestFindCheckpoint:
+    def _make_agent(self, checkpoint: Any = None) -> Agent:
+        return Agent(role="r", goal="g", backstory="b", checkpoint=checkpoint)
+
+    def _make_crew(
+        self, agents: list[Agent], checkpoint: Any = None
+    ) -> Crew:
+        crew = Crew(agents=agents, tasks=[], checkpoint=checkpoint)
+        for a in agents:
+            a.crew = crew
+        return crew
+
+    def test_crew_true(self) -> None:
+        a = self._make_agent()
+        self._make_crew([a], checkpoint=True)
+        cfg = _find_checkpoint(a)
+        assert isinstance(cfg, CheckpointConfig)
+
+    def test_crew_true_agent_false_opts_out(self) -> None:
+        a = self._make_agent(checkpoint=False)
+        self._make_crew([a], checkpoint=True)
+        assert _find_checkpoint(a) is None
+
+    def test_crew_none_agent_none(self) -> None:
+        a = self._make_agent()
+        self._make_crew([a])
+        assert _find_checkpoint(a) is None
+
+    def test_agent_config_overrides_crew(self) -> None:
+        a = self._make_agent(
+            checkpoint=CheckpointConfig(location="/agent_cp")
+        )
+        self._make_crew([a], checkpoint=True)
+        cfg = _find_checkpoint(a)
+        assert isinstance(cfg, CheckpointConfig)
+        assert cfg.location == "/agent_cp"
+
+    def test_task_inherits_from_crew(self) -> None:
+        a = self._make_agent()
+        self._make_crew([a], checkpoint=True)
+        task = Task(description="d", expected_output="e", agent=a)
+        cfg = _find_checkpoint(task)
+        assert isinstance(cfg, CheckpointConfig)
+
+    def test_task_agent_false_blocks(self) -> None:
+        a = self._make_agent(checkpoint=False)
+        self._make_crew([a], checkpoint=True)
+        task = Task(description="d", expected_output="e", agent=a)
+        assert _find_checkpoint(task) is None
+
+    def test_flow_direct(self) -> None:
+        flow = Flow(checkpoint=True)
+        cfg = _find_checkpoint(flow)
+        assert isinstance(cfg, CheckpointConfig)
+
+    def test_flow_none(self) -> None:
+        flow = Flow()
+        assert _find_checkpoint(flow) is None
+
+    def test_unknown_source(self) -> None:
+        assert _find_checkpoint("random") is None
+
+
+
+
+class TestPrune:
+    @pytest.mark.parametrize(
+        ("directory", "branch"),
+        [("checkpoints[1]", "main"), ("checkpoints", "run[1]"), ("checkpoints", "fork/run[1]")],
+    )
+    @pytest.mark.parametrize("max_keep", [0, 1])
+    def test_prune_treats_directory_and_branch_as_literal_paths(
+        self, tmp_path: Path, directory: str, branch: str, max_keep: int
+    ) -> None:
+        provider = JsonProvider()
+        location = str(tmp_path / directory)
+        paths = []
+        for i in range(2):
+            path = Path(provider.checkpoint("{}", location, branch=branch))
+            os.utime(path, (i + 1, i + 1))
+            paths.append(path)
+        # As a glob pattern, "[1]" matches "1", so this path must not be pruned
+        other_path = Path(
+            provider.checkpoint(
+                "{}",
+                str(tmp_path / directory.replace("[1]", "1")),
+                branch=branch.replace("[1]", "1"),
+            )
+        )
+
+        assert provider.prune(location, max_keep=max_keep, branch=branch) == 2 - max_keep
+        assert [path for path in paths if path.exists()] == (paths[-1:] if max_keep else [])
+        assert other_path.exists()
+
+    def test_prune_keeps_newest(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            branch_dir = os.path.join(d, "main")
+            os.makedirs(branch_dir)
+            for i in range(5):
+                path = os.path.join(branch_dir, f"cp_{i}.json")
+                with open(path, "w") as f:
+                    f.write("{}")
+                # Ensure distinct mtime
+                time.sleep(0.01)
+
+            JsonProvider().prune(d, max_keep=2, branch="main")
+            remaining = os.listdir(branch_dir)
+            assert len(remaining) == 2
+            assert "cp_3.json" in remaining
+            assert "cp_4.json" in remaining
+
+    def test_prune_zero_removes_all(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            branch_dir = os.path.join(d, "main")
+            os.makedirs(branch_dir)
+            for i in range(3):
+                with open(os.path.join(branch_dir, f"cp_{i}.json"), "w") as f:
+                    f.write("{}")
+
+            JsonProvider().prune(d, max_keep=0, branch="main")
+            assert os.listdir(branch_dir) == []
+
+    def test_prune_more_than_existing(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            branch_dir = os.path.join(d, "main")
+            os.makedirs(branch_dir)
+            with open(os.path.join(branch_dir, "cp.json"), "w") as f:
+                f.write("{}")
+
+            JsonProvider().prune(d, max_keep=10, branch="main")
+            assert len(os.listdir(branch_dir)) == 1
+
+
+
+
+class TestCheckpointConfig:
+    def test_defaults(self) -> None:
+        cfg = CheckpointConfig()
+        assert cfg.location == "./.checkpoints"
+        assert cfg.on_events == ["task_completed"]
+        assert cfg.max_checkpoints is None
+        assert not cfg.trigger_all
+
+    def test_trigger_all(self) -> None:
+        cfg = CheckpointConfig(on_events=["*"])
+        assert cfg.trigger_all
+
+    def test_restore_from_field(self) -> None:
+        cfg = CheckpointConfig(restore_from="/path/to/checkpoint.json")
+        assert cfg.restore_from == "/path/to/checkpoint.json"
+
+    def test_restore_from_default_none(self) -> None:
+        cfg = CheckpointConfig()
+        assert cfg.restore_from is None
+
+    def test_trigger_events(self) -> None:
+        cfg = CheckpointConfig(
+            on_events=["task_completed", "crew_kickoff_completed"]
+        )
+        assert cfg.trigger_events == {"task_completed", "crew_kickoff_completed"}
+
+
+
+
+class TestRuntimeStateLineage:
+    def _make_state(self) -> RuntimeState:
+        from shards_ai_agents import Agent, Crew
+
+        agent = Agent(role="r", goal="g", backstory="b", llm="gpt-4o-mini")
+        crew = Crew(agents=[agent], tasks=[], verbose=False)
+        return RuntimeState(root=[crew])
+
+    def test_default_lineage_fields(self) -> None:
+        state = self._make_state()
+        assert state._checkpoint_id is None
+        assert state._parent_id is None
+        assert state._branch == "main"
+
+    def test_serialize_includes_version(self) -> None:
+        from shards_ai_agents_core.version import get_shards_ai_agents_version
+
+        state = self._make_state()
+        dumped = json.loads(state.model_dump_json())
+        assert dumped["shards_ai_agents_version"] == get_shards_ai_agents_version()
+
+    def test_deserialize_migrates_on_version_mismatch(self, caplog: Any) -> None:
+        import logging
+
+        state = self._make_state()
+        raw = state.model_dump_json()
+        data = json.loads(raw)
+        data["shards_ai_agents_version"] = "0.1.0"
+        with caplog.at_level(logging.DEBUG):
+            RuntimeState.model_validate_json(
+                json.dumps(data), context={"from_checkpoint": True}
+            )
+        assert "Migrating checkpoint from Shards-ai-agents 0.1.0" in caplog.text
+
+    def test_deserialize_warns_on_missing_version(self, caplog: Any) -> None:
+        import logging
+
+        state = self._make_state()
+        raw = state.model_dump_json()
+        data = json.loads(raw)
+        data.pop("shards_ai_agents_version", None)
+        with caplog.at_level(logging.WARNING):
+            RuntimeState.model_validate_json(
+                json.dumps(data), context={"from_checkpoint": True}
+            )
+        assert "treating as 0.0.0" in caplog.text
+
+    def test_serialize_includes_lineage(self) -> None:
+        state = self._make_state()
+        state._parent_id = "parent456"
+        state._branch = "experiment"
+        dumped = json.loads(state.model_dump_json())
+        assert dumped["parent_id"] == "parent456"
+        assert dumped["branch"] == "experiment"
+        assert "checkpoint_id" not in dumped
+
+    def test_deserialize_restores_lineage(self) -> None:
+        state = self._make_state()
+        state._parent_id = "parent456"
+        state._branch = "experiment"
+        raw = state.model_dump_json()
+        restored = RuntimeState.model_validate_json(
+            raw, context={"from_checkpoint": True}
+        )
+        assert restored._parent_id == "parent456"
+        assert restored._branch == "experiment"
+
+    def test_deserialize_defaults_missing_lineage(self) -> None:
+        state = self._make_state()
+        raw = state.model_dump_json()
+        data = json.loads(raw)
+        data.pop("parent_id", None)
+        data.pop("branch", None)
+        restored = RuntimeState.model_validate_json(
+            json.dumps(data), context={"from_checkpoint": True}
+        )
+        assert restored._parent_id is None
+        assert restored._branch == "main"
+
+    def test_from_checkpoint_sets_checkpoint_id(self) -> None:
+        """from_checkpoint sets _checkpoint_id from the location, not the blob."""
+        state = self._make_state()
+        state._provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            loc = state.checkpoint(d)
+            written_id = state._checkpoint_id
+
+            cfg = CheckpointConfig(restore_from=loc)
+            restored = RuntimeState.from_checkpoint(
+                cfg, context={"from_checkpoint": True}
+            )
+            assert restored._checkpoint_id == written_id
+            assert restored._parent_id == written_id
+
+    def test_fork_sets_branch(self) -> None:
+        state = self._make_state()
+        state._checkpoint_id = "abc12345"
+        state._parent_id = "abc12345"
+        state.fork("my-experiment")
+        assert state._branch == "my-experiment"
+        assert state._parent_id == "abc12345"
+
+    def test_fork_auto_branch(self) -> None:
+        state = self._make_state()
+        state._checkpoint_id = "20260409T120000_abc12345"
+        state.fork()
+        assert state._branch.startswith("fork/20260409T120000_abc12345_")
+        assert len(state._branch) == len("fork/20260409T120000_abc12345_") + 6
+
+    def test_fork_no_checkpoint_id_unique(self) -> None:
+        state = self._make_state()
+        state.fork()
+        assert state._branch.startswith("fork/")
+        assert len(state._branch) == len("fork/") + 8
+        # Two forks without checkpoint_id produce different branches
+        first = state._branch
+        state.fork()
+        assert state._branch != first
+
+
+class TestFlowInitialStateSerialization:
+    """Regression tests for checkpoint serialization of ``Flow.initial_state``."""
+
+    def test_class_ref_serializes_as_schema(self) -> None:
+        class MyState(BaseModel):
+            id: str = "x"
+            foo: str = "bar"
+
+        flow = Flow(initial_state=MyState)
+        state = RuntimeState(root=[flow])
+        dumped = json.loads(state.model_dump_json())
+        entity = dumped["entities"][0]
+        wrapped = entity["initial_state"]
+        assert isinstance(wrapped, dict)
+        assert _INITIAL_STATE_CLASS_MARKER in wrapped
+        assert wrapped[_INITIAL_STATE_CLASS_MARKER].get("title") == "MyState"
+
+    def test_class_ref_round_trips_to_basemodel_subclass(self) -> None:
+        class MyState(BaseModel):
+            id: str = "x"
+            foo: str = "bar"
+
+        flow = Flow(initial_state=MyState)
+        raw = RuntimeState(root=[flow]).model_dump_json()
+        restored = RuntimeState.model_validate_json(
+            raw, context={"from_checkpoint": True}
+        )
+        rehydrated = restored.root[0].initial_state
+        assert isinstance(rehydrated, type)
+        assert issubclass(rehydrated, BaseModel)
+        assert set(rehydrated.model_fields.keys()) == {"id", "foo"}
+
+    def test_instance_serializes_as_values(self) -> None:
+        class MyState(BaseModel):
+            id: str = "x"
+            foo: str = "bar"
+
+        flow = Flow(initial_state=MyState(foo="baz"))
+        state = RuntimeState(root=[flow])
+        dumped = json.loads(state.model_dump_json())
+        entity = dumped["entities"][0]
+        assert entity["initial_state"] == {"id": "x", "foo": "baz"}
+
+    def test_dict_passthrough(self) -> None:
+        flow = Flow(initial_state={"id": "x", "foo": "bar"})
+        state = RuntimeState(root=[flow])
+        dumped = json.loads(state.model_dump_json())
+        entity = dumped["entities"][0]
+        assert entity["initial_state"] == {"id": "x", "foo": "bar"}
+
+    def test_dict_round_trips_as_dict(self) -> None:
+        flow = Flow(initial_state={"id": "x", "foo": "bar"})
+        raw = RuntimeState(root=[flow]).model_dump_json()
+        restored = RuntimeState.model_validate_json(
+            raw, context={"from_checkpoint": True}
+        )
+        assert restored.root[0].initial_state == {"id": "x", "foo": "bar"}
+
+
+
+
+class TestJsonProviderFork:
+    def test_checkpoint_writes_to_branch_subdir(self) -> None:
+        provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            path = provider.checkpoint("{}", d, branch="main")
+            assert "/main/" in path
+            assert path.endswith(".json")
+            assert os.path.isfile(path)
+
+    def test_checkpoint_uses_utf8_for_non_ascii_json(self) -> None:
+        provider = JsonProvider()
+        data = '{"message": "olá niño"}'
+        with tempfile.TemporaryDirectory() as d:
+            path = provider.checkpoint(data, d, branch="main")
+
+            assert Path(path).read_bytes() == data.encode("utf-8")
+            assert provider.from_checkpoint(path) == data
+
+    @pytest.mark.asyncio
+    async def test_acheckpoint_uses_utf8_for_non_ascii_json(self) -> None:
+        provider = JsonProvider()
+        data = '{"message": "olá niño"}'
+        with tempfile.TemporaryDirectory() as d:
+            path = await provider.acheckpoint(data, d, branch="main")
+
+            assert Path(path).read_bytes() == data.encode("utf-8")
+            assert await provider.afrom_checkpoint(path) == data
+
+    def test_checkpoint_fork_branch_subdir(self) -> None:
+        provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            path = provider.checkpoint("{}", d, branch="fork/exp1")
+            assert "/fork/exp1/" in path
+            assert os.path.isfile(path)
+
+    def test_prune_branch_aware(self) -> None:
+        provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            for _ in range(3):
+                provider.checkpoint("{}", d, branch="main")
+                time.sleep(0.01)
+            for _ in range(2):
+                provider.checkpoint("{}", d, branch="fork/a")
+                time.sleep(0.01)
+
+            # Prune main to 1
+            provider.prune(d, max_keep=1, branch="main")
+
+            main_dir = os.path.join(d, "main")
+            fork_dir = os.path.join(d, "fork", "a")
+            assert len(os.listdir(main_dir)) == 1
+            assert len(os.listdir(fork_dir)) == 2
+
+    def test_extract_id(self) -> None:
+        provider = JsonProvider()
+        assert provider.extract_id("/dir/main/20260409T120000_abc12345_p-none.json") == "20260409T120000_abc12345"
+        assert provider.extract_id("/dir/main/20260409T120000_abc12345_p-20260409T115900_def67890.json") == "20260409T120000_abc12345"
+
+    def test_branch_traversal_rejected(self) -> None:
+        provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            with pytest.raises(ValueError, match="escapes checkpoint directory"):
+                provider.checkpoint("{}", d, branch="../../etc")
+            with pytest.raises(ValueError, match="escapes checkpoint directory"):
+                provider.prune(d, max_keep=1, branch="../../etc")
+
+    def test_filename_encodes_parent_id(self) -> None:
+        provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            # First checkpoint — no parent
+            path1 = provider.checkpoint("{}", d, branch="main")
+            assert "_p-none.json" in path1
+
+            # Second checkpoint — with parent
+            id1 = provider.extract_id(path1)
+            path2 = provider.checkpoint("{}", d, parent_id=id1, branch="main")
+            assert f"_p-{id1}.json" in path2
+
+    def test_checkpoint_chaining(self) -> None:
+        """RuntimeState.checkpoint() chains parent_id after each write."""
+        state = self._make_state()
+        state._provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            state.checkpoint(d)
+            id1 = state._checkpoint_id
+            assert id1 is not None
+            assert state._parent_id == id1
+
+            loc2 = state.checkpoint(d)
+            id2 = state._checkpoint_id
+            assert id2 is not None
+            assert id2 != id1
+            assert state._parent_id == id2
+
+            with open(loc2) as f:
+                data2 = json.loads(f.read())
+            assert data2["parent_id"] == id1
+
+    @pytest.mark.asyncio
+    async def test_acheckpoint_chaining(self) -> None:
+        """Async checkpoint path chains lineage identically to sync."""
+        state = self._make_state()
+        state._provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            await state.acheckpoint(d)
+            id1 = state._checkpoint_id
+            assert id1 is not None
+
+            loc2 = await state.acheckpoint(d)
+            id2 = state._checkpoint_id
+            assert id2 != id1
+            assert state._parent_id == id2
+
+            with open(loc2) as f:
+                data2 = json.loads(f.read())
+            assert data2["parent_id"] == id1
+
+    def _make_state(self) -> RuntimeState:
+        from shards_ai_agents import Agent, Crew
+
+        agent = Agent(role="r", goal="g", backstory="b", llm="gpt-4o-mini")
+        crew = Crew(agents=[agent], tasks=[], verbose=False)
+        return RuntimeState(root=[crew])
+
+
+
+
+class TestSqliteProviderFork:
+    def test_checkpoint_stores_branch_and_parent(self) -> None:
+        provider = SqliteProvider()
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "cp.db")
+            loc = provider.checkpoint("{}", db, parent_id="p1", branch="exp")
+            cid = provider.extract_id(loc)
+
+            with closing(sqlite3.connect(db)) as conn:
+                row = conn.execute(
+                    "SELECT parent_id, branch FROM checkpoints WHERE id = ?",
+                    (cid,),
+                ).fetchone()
+            assert row == ("p1", "exp")
+
+    def test_prune_branch_aware(self) -> None:
+        provider = SqliteProvider()
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "cp.db")
+            for _ in range(3):
+                provider.checkpoint("{}", db, branch="main")
+            for _ in range(2):
+                provider.checkpoint("{}", db, branch="fork/a")
+
+            provider.prune(db, max_keep=1, branch="main")
+
+            with closing(sqlite3.connect(db)) as conn:
+                main_count = conn.execute(
+                    "SELECT COUNT(*) FROM checkpoints WHERE branch = 'main'"
+                ).fetchone()[0]
+                fork_count = conn.execute(
+                    "SELECT COUNT(*) FROM checkpoints WHERE branch = 'fork/a'"
+                ).fetchone()[0]
+            assert main_count == 1
+            assert fork_count == 2
+
+    def test_extract_id(self) -> None:
+        provider = SqliteProvider()
+        assert provider.extract_id("/path/to/db#abc123") == "abc123"
+
+    def test_checkpoint_chaining_sqlite(self) -> None:
+        state = self._make_state()
+        state._provider = SqliteProvider()
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "cp.db")
+            state.checkpoint(db)
+            id1 = state._checkpoint_id
+
+            state.checkpoint(db)
+            id2 = state._checkpoint_id
+            assert id2 != id1
+
+            with closing(sqlite3.connect(db)) as conn:
+                row = conn.execute(
+                    "SELECT parent_id FROM checkpoints WHERE id = ?", (id2,)
+                ).fetchone()
+            assert row[0] == id1
+
+    def _make_state(self) -> RuntimeState:
+        from shards_ai_agents import Agent, Crew
+
+        agent = Agent(role="r", goal="g", backstory="b", llm="gpt-4o-mini")
+        crew = Crew(agents=[agent], tasks=[], verbose=False)
+        return RuntimeState(root=[crew])
+
+
+
+
+class TestKickoffFromCheckpoint:
+    def test_crew_kickoff_delegates_to_from_checkpoint(self) -> None:
+        mock_restored = MagicMock(spec=Crew)
+        mock_restored.kickoff.return_value = "result"
+
+        cfg = CheckpointConfig(restore_from="/path/to/cp.json")
+        with patch.object(Crew, "from_checkpoint", return_value=mock_restored):
+            agent = Agent(role="r", goal="g", backstory="b", llm="gpt-4o-mini")
+            crew = Crew(agents=[agent], tasks=[], verbose=False)
+            result = crew.kickoff(inputs={"k": "v"}, from_checkpoint=cfg)
+
+        mock_restored.kickoff.assert_called_once_with(
+            inputs={"k": "v"}, input_files=None
+        )
+        assert mock_restored.checkpoint.restore_from is None
+        assert result == "result"
+
+    def test_crew_kickoff_config_only_sets_checkpoint(self) -> None:
+        cfg = CheckpointConfig(on_events=["task_completed"])
+        agent = Agent(role="r", goal="g", backstory="b", llm="gpt-4o-mini")
+        crew = Crew(agents=[agent], tasks=[], verbose=False)
+        assert crew.checkpoint is None
+        with patch("shards_ai_agents.crew.get_env_context"), \
+             patch("shards_ai_agents.crew.prepare_kickoff", side_effect=RuntimeError("stop")):
+            with pytest.raises(RuntimeError, match="stop"):
+                crew.kickoff(from_checkpoint=cfg)
+        assert isinstance(crew.checkpoint, CheckpointConfig)
+        assert crew.checkpoint.on_events == ["task_completed"]
+
+    def test_agent_kickoff_delegates_to_from_checkpoint(self) -> None:
+        mock_restored = MagicMock(spec=Agent)
+        mock_restored.kickoff.return_value = "agent_result"
+
+        cfg = CheckpointConfig(restore_from="/path/to/agent_cp.json")
+        with patch.object(Agent, "from_checkpoint", return_value=mock_restored):
+            agent = Agent(role="r", goal="g", backstory="b", llm="gpt-4o-mini")
+            result = agent.kickoff(messages="hello", from_checkpoint=cfg)
+
+        mock_restored.kickoff.assert_called_once_with(
+            messages="hello", response_format=None, input_files=None
+        )
+        assert mock_restored.checkpoint.restore_from is None
+        assert result == "agent_result"
+
+    def test_agent_kickoff_config_only_sets_checkpoint(self) -> None:
+        cfg = CheckpointConfig(on_events=["lite_agent_execution_completed"])
+        agent = Agent(role="r", goal="g", backstory="b", llm="gpt-4o-mini")
+        assert agent.checkpoint is None
+        with patch.object(Agent, "_prepare_kickoff", side_effect=RuntimeError("stop")):
+            with pytest.raises(RuntimeError, match="stop"):
+                agent.kickoff(messages="hello", from_checkpoint=cfg)
+        assert isinstance(agent.checkpoint, CheckpointConfig)
+        assert agent.checkpoint.on_events == ["lite_agent_execution_completed"]
+
+    def test_flow_kickoff_delegates_to_from_checkpoint(self) -> None:
+        mock_restored = MagicMock(spec=Flow)
+        mock_restored.kickoff.return_value = "flow_result"
+
+        cfg = CheckpointConfig(restore_from="/path/to/flow_cp.json")
+        with patch.object(Flow, "from_checkpoint", return_value=mock_restored):
+            flow = Flow()
+            result = flow.kickoff(from_checkpoint=cfg)
+
+        mock_restored.kickoff.assert_called_once_with(
+            inputs=None, input_files=None
+        )
+        assert mock_restored.checkpoint.restore_from is None
+        assert result == "flow_result"
+
+
+
+
+class TestLegacyMethodOutputsRestore:
+    def test_restore_wraps_legacy_plain_value_outputs(self) -> None:
+        flow = Flow()
+        flow._method_outputs = ["first", "second"]
+        state = RuntimeState(root=[flow])
+        state._provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            loc = state.checkpoint(d)
+            cfg = CheckpointConfig(restore_from=loc)
+            restored = Flow.from_checkpoint(cfg)
+
+        assert restored.method_outputs == ["first", "second"]
+
+    def test_restore_legacy_outputs_evaluates_expressions(self) -> None:
+        from shards_ai_agents.flow.expressions import Expression
+
+        flow = Flow()
+        flow._method_outputs = ["legacy"]
+        state = RuntimeState(root=[flow])
+        state._provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            loc = state.checkpoint(d)
+            cfg = CheckpointConfig(restore_from=loc)
+            restored = Flow.from_checkpoint(cfg)
+
+        context = Expression._flow_context(restored)
+        assert context["outputs"] == {"": "legacy"}
+
+    def test_raw_legacy_outputs_property_remains_readable(self) -> None:
+        flow = Flow()
+        flow._method_outputs = ["legacy"]
+
+        assert flow.method_outputs == ["legacy"]
+
+
+class TestAgentCheckpoint:
+    def _make_agent_state(self) -> RuntimeState:
+        agent = Agent(role="r", goal="g", backstory="b", llm="gpt-4o-mini")
+        return RuntimeState(root=[agent])
+
+    def test_agent_from_checkpoint_sets_runtime_state(self) -> None:
+        state = self._make_agent_state()
+        state._provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            loc = state.checkpoint(d)
+            cfg = CheckpointConfig(restore_from=loc)
+
+            from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+
+            shards_ai_agents_event_bus._runtime_state = None
+            Agent.from_checkpoint(cfg)
+            assert shards_ai_agents_event_bus._runtime_state is not None
+
+    def test_agent_fork_sets_branch(self) -> None:
+        state = self._make_agent_state()
+        state._provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            loc = state.checkpoint(d)
+            cfg = CheckpointConfig(restore_from=loc)
+
+            from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+
+            Agent.fork(cfg, branch="agent-experiment")
+            rt = shards_ai_agents_event_bus._runtime_state
+            assert rt is not None
+            assert rt._branch == "agent-experiment"
+
+    def test_agent_fork_auto_branch(self) -> None:
+        state = self._make_agent_state()
+        state._provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            loc = state.checkpoint(d)
+            cfg = CheckpointConfig(restore_from=loc)
+
+            from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+
+            Agent.fork(cfg)
+            rt = shards_ai_agents_event_bus._runtime_state
+            assert rt is not None
+            assert rt._branch.startswith("fork/")
+
+    def test_sync_checkpoint_fields_agent(self) -> None:
+        from shards_ai_agents.state.runtime import _sync_checkpoint_fields
+
+        agent = Agent(role="r", goal="g", backstory="b", llm="gpt-4o-mini")
+        agent._kickoff_event_id = "evt-123"
+        _sync_checkpoint_fields(agent)
+        assert agent.checkpoint_kickoff_event_id == "evt-123"
+
+    def test_agent_restore_kickoff_event_id(self) -> None:
+        agent = Agent(role="r", goal="g", backstory="b", llm="gpt-4o-mini")
+        agent._kickoff_event_id = "evt-456"
+        state = RuntimeState(root=[agent])
+        state._provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            from shards_ai_agents.state.runtime import _prepare_entities
+
+            _prepare_entities(state.root)
+            loc = state.checkpoint(d)
+            cfg = CheckpointConfig(restore_from=loc)
+            restored = Agent.from_checkpoint(cfg)
+            assert restored._kickoff_event_id == "evt-456"
+
+
+class _FinalAnswerLLM(BaseLLM):
+    """Stub LLM that always returns a final answer without any API calls."""
+
+    def __init__(self) -> None:
+        super().__init__(model="stub")
+
+    def call(
+        self,
+        messages,
+        tools=None,
+        callbacks=None,
+        available_functions=None,
+        from_task=None,
+        from_agent=None,
+        response_model=None,
+    ):
+        return "Final Answer: done."
+
+    def supports_function_calling(self) -> bool:
+        return False
+
+    def supports_stop_words(self) -> bool:
+        return False
+
+    def get_context_window_size(self) -> int:
+        return 4096
+
+    async def acall(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+class TestCheckpointReusedExecutor:
+    """Checkpoint serialization stamps every live Flow's completed methods.
+
+    The agent executor is a Flow reused across a crew's tasks, so the stamp
+    must not be read back as a restore signal on the next task — otherwise the
+    second task replays as a resume and never reaches a final answer.
+    """
+
+    def test_second_task_runs_with_checkpointing_enabled(self) -> None:
+        agent = Agent(role="r", goal="g", backstory="b", llm=_FinalAnswerLLM())
+        task1 = Task(description="first", expected_output="x", agent=agent)
+        task2 = Task(description="second", expected_output="y", agent=agent)
+        with tempfile.TemporaryDirectory() as d:
+            crew = Crew(
+                agents=[agent],
+                tasks=[task1, task2],
+                verbose=False,
+                checkpoint=CheckpointConfig(
+                    provider=JsonProvider(location=d),
+                    on_events=["task_started", "task_completed"],
+                ),
+            )
+            result = crew.kickoff()
+
+        assert len(result.tasks_output) == 2
+        assert result.tasks_output[1].raw
+
+
+class TestCustomLLMCheckpointRestore:
+    """A custom BaseLLM subclass serializes with the inherited llm_type "base".
+
+    Restoring it must not try to instantiate the abstract BaseLLM; it is rebuilt
+    as a concrete LLM from the saved config instead.
+    """
+
+    def test_restore_does_not_instantiate_abstract_base_llm(self) -> None:
+        agent = Agent(role="r", goal="g", backstory="b", llm=_FinalAnswerLLM())
+        task = Task(description="d", expected_output="e", agent=agent)
+        crew = Crew(agents=[agent], tasks=[task], verbose=False)
+
+        raw = RuntimeState(root=[crew]).model_dump_json()
+        restored = RuntimeState.model_validate_json(
+            raw, context={"from_checkpoint": True}
+        )
+
+        llm = restored.root[0].agents[0].llm
+        assert isinstance(llm, BaseLLM)
+        assert not inspect.isabstract(type(llm))
+        assert llm.model == "stub"
+
+
+class TestCrewCheckpointTaskTemplates:
+    """A restored crew keeps each task's uninterpolated templates.
+
+    Resuming re-interpolates the description and expected output from the
+    saved originals, so each must be saved from its own field.
+    """
+
+    def test_restore_keeps_original_expected_output(self) -> None:
+        agent = Agent(role="r", goal="g", backstory="b", llm=_FinalAnswerLLM())
+        task = Task(
+            description="Research {topic}",
+            expected_output="A summary of {topic}",
+            agent=agent,
+        )
+        crew = Crew(agents=[agent], tasks=[task], verbose=False)
+        task.interpolate_inputs_and_add_conversation_history({"topic": "AI"})
+
+        state = RuntimeState(root=[crew])
+        state._provider = JsonProvider()
+        with tempfile.TemporaryDirectory() as d:
+            loc = state.checkpoint(d)
+            restored = Crew.from_checkpoint(CheckpointConfig(restore_from=loc))
+
+        restored_task = restored.tasks[0]
+        expected_template = "A summary of {topic}"
+        assert restored_task.checkpoint_original_description == "Research {topic}"
+        assert restored_task.checkpoint_original_expected_output == expected_template
+        assert restored_task._original_expected_output == expected_template
+
+
+_RAN_TASKS: list[str] = []
+
+
+def _record_task(output: Any) -> None:
+    _RAN_TASKS.append(output.description)
+
+
+def _record_task_level(output: Any) -> None:
+    _RAN_TASKS.append(f"task:{output.description}")
+
+
+class _CallbackOwner:
+    def on_task_done(self, output: Any) -> None:
+        _RAN_TASKS.append(f"bound:{output.description}")
+
+    def never_cache(self, _args: Any = None, _result: Any = None) -> bool:
+        return False
+
+
+class _EchoTool(BaseTool):
+    name: str = "echo"
+    description: str = "Echoes its input."
+
+    def _run(self, text: str) -> str:
+        return text
+
+
+class TestCallbacksAcrossRestore:
+    """A restore builds the crew from the checkpoint file, not from the crew
+    ``kickoff`` is called on, so callbacks survive only as dotted paths.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fake_openai(self, monkeypatch: pytest.MonkeyPatch) -> Any:
+        from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+        from shards_ai_agents.llms.providers.openai.completion import OpenAICompletion
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
+        # The root conftest clears the event bus after every test, but the
+        # listener's register-once flag stays set; reset it so this test's
+        # checkpoint handlers are registered again.
+        monkeypatch.setattr(
+            "shards_ai_agents.state.checkpoint_listener._handlers_registered", False
+        )
+        # from_checkpoint() attaches the restored state to the bus and nothing
+        # detaches it; a stale state would become this run's checkpoint parent.
+        shards_ai_agents_event_bus.reset_runtime_state()
+        _RAN_TASKS.clear()
+        with (
+            patch.object(OpenAICompletion, "call", return_value="Final Answer: done."),
+            patch.object(OpenAICompletion, "acall", return_value="Final Answer: done."),
+        ):
+            yield
+        shards_ai_agents_event_bus.reset_runtime_state()
+        _RAN_TASKS.clear()
+
+    def _build(
+        self, location: Path, second_callback: Any, **agent_kwargs: Any
+    ) -> Crew:
+        from shards_ai_agents.llm import LLM
+
+        agent = Agent(
+            role="r",
+            goal="g",
+            backstory="b",
+            llm=LLM(model="gpt-4o-mini"),
+            **agent_kwargs,
+        )
+        first = Task(description="first", expected_output="x", agent=agent)
+        second = Task(
+            description="second",
+            expected_output="y",
+            agent=agent,
+            callback=second_callback,
+        )
+        return Crew(
+            agents=[agent],
+            tasks=[first, second],
+            verbose=False,
+            task_callback=_record_task,
+            checkpoint=CheckpointConfig(
+                location=str(location), on_events=["task_completed"]
+            ),
+        )
+
+    def _first_task_checkpoint(self, location: Path) -> str:
+        """Return the checkpoint written after the first task completed."""
+        roots = list(location.rglob("*_p-none.json"))
+        assert len(roots) == 1, roots
+        return str(roots[0])
+
+    def _restore_config(self, tmp_path: Path, saved: str) -> CheckpointConfig:
+        return CheckpointConfig(
+            restore_from=saved, location=str(tmp_path / "resumed")
+        )
+
+    def _run_once(
+        self, tmp_path: Path, second_callback: Any, **agent_kwargs: Any
+    ) -> str:
+        self._build(tmp_path / "run", second_callback, **agent_kwargs).kickoff()
+        _RAN_TASKS.clear()
+        return self._first_task_checkpoint(tmp_path / "run")
+
+    @pytest.mark.parametrize("kickoff", ["kickoff", "kickoff_async", "akickoff"])
+    def test_bound_method_callback_is_dropped_and_restore_completes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        kickoff: str,
+    ) -> None:
+        import asyncio
+
+        monkeypatch.setenv("SHARDS_AI_AGENTS_DESERIALIZE_CALLBACKS", "1")
+        with pytest.warns(UserWarning, match="dropped and will not run"):
+            saved = self._run_once(tmp_path, _CallbackOwner().on_task_done)
+        assert _RAN_TASKS == []
+
+        with pytest.warns(UserWarning, match="dropped and will not run"):
+            crew = self._build(tmp_path / "unused", _CallbackOwner().on_task_done)
+        config = self._restore_config(tmp_path, saved)
+        if kickoff == "kickoff":
+            result = crew.kickoff(from_checkpoint=config)
+        else:
+            result = asyncio.run(getattr(crew, kickoff)(from_checkpoint=config))
+
+        assert len(result.tasks_output) == 2
+        assert _RAN_TASKS == ["second"]
+
+    def test_partial_callback_still_writes_checkpoints(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import functools
+
+        monkeypatch.setenv("SHARDS_AI_AGENTS_DESERIALIZE_CALLBACKS", "1")
+        callback = functools.partial(_record_task_level)
+        with pytest.warns(UserWarning, match="A partial callback cannot be saved"):
+            saved = self._run_once(tmp_path, callback)
+
+        with open(saved) as f:
+            data = json.loads(f.read())
+        assert data["entities"][0]["tasks"][1]["callback"] is None
+
+        with pytest.warns(UserWarning, match="A partial callback cannot be saved"):
+            crew = self._build(tmp_path / "unused", callback)
+        result = crew.kickoff(from_checkpoint=self._restore_config(tmp_path, saved))
+        assert len(result.tasks_output) == 2
+        assert _RAN_TASKS == ["second"]
+
+    def test_named_callback_runs_once_for_the_remaining_task(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SHARDS_AI_AGENTS_DESERIALIZE_CALLBACKS", "1")
+        saved = self._run_once(tmp_path, _record_task_level)
+
+        self._build(tmp_path / "unused", None).kickoff(
+            from_checkpoint=self._restore_config(tmp_path, saved)
+        )
+
+        assert _RAN_TASKS == ["task:second", "second"]
+
+    def test_named_callback_restore_is_refused_without_opt_in(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SHARDS_AI_AGENTS_DESERIALIZE_CALLBACKS", raising=False)
+        saved = self._run_once(tmp_path, _record_task_level)
+
+        with pytest.raises(ValueError, match="set SHARDS_AI_AGENTS_DESERIALIZE_CALLBACKS=1"):
+            self._build(tmp_path / "unused", _record_task_level).kickoff(
+                from_checkpoint=self._restore_config(tmp_path, saved)
+            )
+        assert _RAN_TASKS == []
+
+    @pytest.mark.parametrize(
+        "make_callable",
+        [
+            lambda: lambda _args=None, _result=None: False,
+            lambda: _CallbackOwner().never_cache,
+        ],
+        ids=["lambda", "bound_method"],
+    )
+    def test_unsaveable_tool_cache_function_and_agent_callback_do_not_block_restore(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        make_callable: Any,
+    ) -> None:
+        monkeypatch.setenv("SHARDS_AI_AGENTS_DESERIALIZE_CALLBACKS", "1")
+        with pytest.warns(UserWarning, match="dropped and will not run"):
+            saved = self._run_once(
+                tmp_path,
+                None,
+                tools=[_EchoTool(cache_function=make_callable())],
+                callbacks=[make_callable()],
+            )
+
+        restored = Crew.from_checkpoint(self._restore_config(tmp_path, saved))
+
+        agent = restored.agents[0]
+        assert agent.callbacks == []
+        assert [tool.name for tool in agent.tools] == ["echo"]
+        # The lost cache_function may have guarded a state-changing tool.
+        assert agent.tools[0].cache_function(None, None) is False
+        # It is saved by name, so a checkpoint of the restored run keeps it closed.
+        assert (
+            json.loads(agent.tools[0].model_dump_json())["cache_function"]
+            == "shards_ai_agents.tools.base_tool._never_cache_function"
+        )
+        assert len(restored.kickoff().tasks_output) == 2
+

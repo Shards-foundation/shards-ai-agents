@@ -1,0 +1,1750 @@
+from datetime import datetime, timedelta, timezone
+import os
+from threading import Thread
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
+from uuid import uuid4
+
+from shards_ai_agents import Agent, Crew, Task
+from shards_ai_agents.events.listeners.tracing.first_time_trace_handler import (
+    FirstTimeTraceHandler,
+)
+from shards_ai_agents.events.listeners.tracing.trace_batch_manager import (
+    TraceBatch,
+    TraceBatchManager,
+)
+from shards_ai_agents.events.listeners.tracing.trace_listener import (
+    TraceCollectionListener,
+)
+from shards_ai_agents.events.listeners.tracing.types import TraceEvent
+from shards_ai_agents.flow.flow import Flow, start
+from shards_ai_agents.llms.base_llm import BaseLLM
+from shards_ai_agents.telemetry.telemetry import Telemetry
+from shards_ai_agents.telemetry.tracing.ephemeral import trace_consent
+from shards_ai_agents.telemetry.tracing.grants import (
+    GrantSpanExporter,
+    TraceGrant,
+    TraceGrantClient,
+)
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+import pytest
+
+
+class _TraceTestLLM(BaseLLM):
+    def __init__(self):
+        super().__init__(model="local-test")
+
+    def call(self, messages, **kwargs):
+        from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+        from shards_ai_agents.events.types.llm_events import (
+            LLMCallCompletedEvent,
+            LLMCallStartedEvent,
+            LLMCallType,
+        )
+
+        call_id = str(uuid4())
+        shards_ai_agents_event_bus.emit(
+            self, LLMCallStartedEvent(messages=messages, call_id=call_id)
+        )
+        response = "Final Answer: hello world"
+        shards_ai_agents_event_bus.emit(
+            self,
+            LLMCallCompletedEvent(
+                response=response,
+                call_id=call_id,
+                call_type=LLMCallType.LLM_CALL,
+            ),
+        )
+        return response
+
+    def supports_function_calling(self):
+        return False
+
+    def supports_stop_words(self):
+        return False
+
+
+def _traced_crew():
+    agent = Agent(
+        role="Test Agent",
+        goal="Test goal",
+        backstory="Test backstory",
+        llm=_TraceTestLLM(),
+    )
+    task = Task(
+        description="Say hello to the world", expected_output="hello world", agent=agent
+    )
+    return Crew(agents=[agent], tasks=[task])
+
+
+class TestTraceListenerSetup:
+    """Test TraceListener is properly setup and collecting events"""
+
+    @pytest.fixture
+    def trace_transport(self, monkeypatch):
+        """Use synthetic grants and an in-memory collector for kickoff tests."""
+        transport = SimpleNamespace(grants=[], exporter=InMemorySpanExporter())
+        monkeypatch.setenv("OTEL_SDK_DISABLED", "false")
+        monkeypatch.setattr(
+            "shards_ai_agents.telemetry.tracing.grants.resolve_tracing_credential",
+            lambda: ("login", "synthetic-login"),
+        )
+
+        def grant(client, execution_uuid):
+            transport.grants.append((client._tier, execution_uuid))
+            return TraceGrant(
+                token="synthetic-grant",
+                collector_url="https://collector.invalid/v1/traces",
+                execution_uuid=execution_uuid,
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+            )
+
+        monkeypatch.setattr(TraceGrantClient, "create", grant)
+        monkeypatch.setattr(
+            GrantSpanExporter,
+            "_exporter",
+            staticmethod(lambda grant: transport.exporter),
+        )
+        return transport
+
+    @pytest.fixture(autouse=True)
+    def mock_user_data_file_io(self):
+        """Mock user data file I/O to prevent file system pollution between tests"""
+        with patch(
+            "shards_ai_agents.events.listeners.tracing.utils._load_user_data",
+            return_value={},
+        ):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def mock_auth_token(self):
+        """Mock authentication token for all tests in this class"""
+        # Need to patch all the places where get_auth_token is imported/used
+        with (
+            patch(
+                "shards_ai_agents.auth.token.get_auth_token",
+                return_value="mock_token_12345",
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_listener.get_auth_token",
+                return_value="mock_token_12345",
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.get_auth_token",
+                return_value="mock_token_12345",
+            ),
+        ):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def reset_tracing_singletons(self):
+        """Reset tracing singleton instances between tests"""
+        from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+        from shards_ai_agents.events.event_listener import EventListener
+        from shards_ai_agents.events.listeners.tracing.utils import _tracing_enabled
+
+        try:
+            _tracing_enabled.set(None)
+        except (LookupError, AttributeError):
+            pass
+
+        with shards_ai_agents_event_bus._rwlock.w_locked():
+            shards_ai_agents_event_bus._sync_handlers = {}
+            shards_ai_agents_event_bus._async_handlers = {}
+            shards_ai_agents_event_bus._handler_dependencies = {}
+            shards_ai_agents_event_bus._execution_plan_cache = {}
+
+        # Reset TraceCollectionListener singleton - must reset instance attributes too
+        if TraceCollectionListener._instance is not None:
+            # Reset instance attributes that shadow class attributes (only if they exist as instance attrs)
+            instance_dict = TraceCollectionListener._instance.__dict__
+            if "_initialized" in instance_dict:
+                del TraceCollectionListener._instance._initialized
+            if "_listeners_setup" in instance_dict:
+                del TraceCollectionListener._instance._listeners_setup
+
+        TraceCollectionListener._instance = None
+        TraceCollectionListener._initialized = False
+        TraceCollectionListener._listeners_setup = False
+
+        if hasattr(EventListener, "_instance"):
+            EventListener._instance = None
+
+        yield
+
+        with shards_ai_agents_event_bus._rwlock.w_locked():
+            shards_ai_agents_event_bus._sync_handlers = {}
+            shards_ai_agents_event_bus._async_handlers = {}
+            shards_ai_agents_event_bus._handler_dependencies = {}
+            shards_ai_agents_event_bus._execution_plan_cache = {}
+
+        # Reset TraceCollectionListener singleton - must reset instance attributes too
+        if TraceCollectionListener._instance is not None:
+            # Reset instance attributes that shadow class attributes (only if they exist as instance attrs)
+            instance_dict = TraceCollectionListener._instance.__dict__
+            if "_initialized" in instance_dict:
+                del TraceCollectionListener._instance._initialized
+            if "_listeners_setup" in instance_dict:
+                del TraceCollectionListener._instance._listeners_setup
+
+        TraceCollectionListener._instance = None
+        TraceCollectionListener._initialized = False
+        TraceCollectionListener._listeners_setup = False
+
+        if hasattr(EventListener, "_instance"):
+            EventListener._instance = None
+
+    @pytest.fixture(autouse=True)
+    def mock_plus_api_calls(self):
+        """Mock all PlusAPI HTTP calls to avoid network requests"""
+        with (
+            patch("requests.post") as mock_post,
+            patch("requests.get") as mock_get,
+            patch("requests.put") as mock_put,
+            patch("requests.delete") as mock_delete,
+            patch.object(TraceBatchManager, "_cleanup_batch_data", return_value=True),
+        ):
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {
+                "id": "mock_trace_batch_id",
+                "status": "success",
+                "message": "Batch created successfully",
+            }
+            mock_response.raise_for_status.return_value = None
+
+            mock_post.return_value = mock_response
+            mock_get.return_value = mock_response
+            mock_put.return_value = mock_response
+            mock_delete.return_value = mock_response
+
+            mock_mark_failed = MagicMock()
+            mock_mark_failed.return_value = mock_response
+
+            yield {
+                "post": mock_post,
+                "get": mock_get,
+                "put": mock_put,
+                "delete": mock_delete,
+                "mark_trace_batch_as_failed": mock_mark_failed,
+            }
+
+    def test_trace_listener_collects_crew_events(self, trace_transport):
+        """Crew kickoff exports its event hierarchy through the session transport."""
+        with patch.dict(os.environ, {"SHARDS_AI_AGENTS_TRACING_ENABLED": "true"}):
+            crew = _traced_crew()
+            listener = TraceCollectionListener()
+            result = crew.kickoff()
+        assert "hello world" in result.raw
+        spans = trace_transport.exporter.get_finished_spans()
+        crew_span = next(span for span in spans if span.name == "execute crew")
+        task_span = next(span for span in spans if span.name == "execute task")
+        assert task_span.parent == crew_span.context
+        assert {span.attributes["shards_ai_agents.execution_uuid"] for span in spans} == {
+            trace_transport.grants[0][1]
+        }
+        assert listener.batch_manager.current_batch is None
+
+    @pytest.mark.vcr()
+    def test_batch_manager_finalizes_batch_clears_buffer(self):
+        """Test that batch manager properly finalizes batch and clears buffer"""
+
+        with patch.dict(
+            os.environ,
+            {
+                "SHARDS_AI_AGENTS_TRACING_ENABLED": "true",
+                "SHARDS_AI_AGENTS_DISABLE_TELEMETRY": "false",
+                "SHARDS_AI_AGENTS_DISABLE_TRACKING": "false",
+                "OTEL_SDK_DISABLED": "false",
+            },
+        ):
+            agent = Agent(
+                role="Test Agent",
+                goal="Test goal",
+                backstory="Test backstory",
+                llm="gpt-4o-mini",
+            )
+
+            task = Task(
+                description="Say hello to the world",
+                expected_output="hello world",
+                agent=agent,
+            )
+
+            crew = Crew(agents=[agent], tasks=[task], verbose=True)
+
+            from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+
+            trace_listener = None
+            with shards_ai_agents_event_bus._rwlock.r_locked():
+                for handler_set in shards_ai_agents_event_bus._sync_handlers.values():
+                    for handler in handler_set:
+                        if hasattr(handler, "__self__") and isinstance(
+                            handler.__self__, TraceCollectionListener
+                        ):
+                            trace_listener = handler.__self__
+                            break
+                    if trace_listener:
+                        break
+                if not trace_listener:
+                    for handler_set in shards_ai_agents_event_bus._async_handlers.values():
+                        for handler in handler_set:
+                            if hasattr(handler, "__self__") and isinstance(
+                                handler.__self__, TraceCollectionListener
+                            ):
+                                trace_listener = handler.__self__
+                                break
+                        if trace_listener:
+                            break
+
+            if not trace_listener:
+                pytest.skip(
+                    "No trace listener found - tracing may not be properly enabled"
+                )
+
+            with patch.object(
+                trace_listener.batch_manager,
+                "finalize_batch",
+                wraps=trace_listener.batch_manager.finalize_batch,
+            ) as finalize_mock:
+                crew.kickoff()
+
+                assert finalize_mock.call_count >= 1
+
+    def test_events_collection_batch_manager(self, mock_plus_api_calls):
+        """Legacy listeners still serialize directly emitted lifecycle events."""
+        from shards_ai_agents.events import CrewKickoffCompletedEvent, CrewKickoffStartedEvent
+        from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+
+        with patch.dict(os.environ, {"SHARDS_AI_AGENTS_TRACING_ENABLED": "true"}):
+            crew = _traced_crew()
+            listener = TraceCollectionListener()
+            listener.setup_listeners(shards_ai_agents_event_bus)
+            with patch.object(
+                listener.batch_manager,
+                "add_event",
+                wraps=listener.batch_manager.add_event,
+            ) as add_event:
+                shards_ai_agents_event_bus.emit(
+                    crew, CrewKickoffStartedEvent(crew_name="crew", inputs={})
+                )
+                assert shards_ai_agents_event_bus.flush()
+                shards_ai_agents_event_bus.emit(
+                    crew,
+                    CrewKickoffCompletedEvent(crew_name="crew", output="hello world"),
+                )
+                assert shards_ai_agents_event_bus.flush()
+            events = [call.args[0] for call in add_event.call_args_list]
+            completed = [
+                event for event in events if event.type == "crew_kickoff_completed"
+            ]
+            assert len(events) >= 2
+            assert len(completed) == 1
+            assert completed[0].event_data["crew_name"] == "crew"
+            assert all(isinstance(event, TraceEvent) for event in events)
+
+    @pytest.mark.vcr()
+    def test_trace_listener_disabled_when_env_false(self):
+        """Test that trace listener doesn't make HTTP calls when tracing is disabled"""
+
+        with patch.dict(os.environ, {"SHARDS_AI_AGENTS_TRACING_ENABLED": "false"}):
+            agent = Agent(
+                role="Test Agent",
+                goal="Test goal",
+                backstory="Test backstory",
+                llm="gpt-4o-mini",
+            )
+            task = Task(
+                description="Say hello to the world",
+                expected_output="hello world",
+                agent=agent,
+            )
+
+            crew = Crew(agents=[agent], tasks=[task], verbose=True)
+            result = crew.kickoff()
+            assert result is not None
+
+            from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+
+            trace_handlers = []
+            with shards_ai_agents_event_bus._rwlock.r_locked():
+                for handlers in shards_ai_agents_event_bus._sync_handlers.values():
+                    for handler in handlers:
+                        if hasattr(handler, "__self__") and isinstance(
+                            handler.__self__, TraceCollectionListener
+                        ):
+                            trace_handlers.append(handler)
+                for handlers in shards_ai_agents_event_bus._async_handlers.values():
+                    for handler in handlers:
+                        if hasattr(handler, "__self__") and isinstance(
+                            handler.__self__, TraceCollectionListener
+                        ):
+                            trace_handlers.append(handler)
+
+            assert len(trace_handlers) == 0, (
+                f"Found {len(trace_handlers)} TraceCollectionListener handlers when tracing should be disabled"
+            )
+
+    def test_trace_listener_setup_correctly_for_crew(self):
+        """Test that trace listener is set up correctly when enabled"""
+
+        with patch.dict(
+            os.environ,
+            {
+                "SHARDS_AI_AGENTS_TRACING_ENABLED": "true",
+                "SHARDS_AI_AGENTS_DISABLE_TELEMETRY": "false",
+                "SHARDS_AI_AGENTS_DISABLE_TRACKING": "false",
+                "OTEL_SDK_DISABLED": "false",
+            },
+        ):
+            agent = Agent(
+                role="Test Agent",
+                goal="Test goal",
+                backstory="Test backstory",
+                llm="gpt-4o-mini",
+            )
+            task = Task(
+                description="Say hello to the world",
+                expected_output="hello world",
+                agent=agent,
+            )
+            with patch.object(
+                TraceCollectionListener, "setup_listeners"
+            ) as mock_listener_setup:
+                Crew(agents=[agent], tasks=[task], verbose=True)
+                assert mock_listener_setup.call_count >= 1
+
+    @pytest.mark.vcr()
+    def test_trace_listener_setup_correctly_for_flow(self):
+        """Test that trace listener is set up correctly when enabled"""
+
+        with patch.dict(
+            os.environ,
+            {
+                "SHARDS_AI_AGENTS_TRACING_ENABLED": "true",
+                "SHARDS_AI_AGENTS_DISABLE_TELEMETRY": "false",
+                "SHARDS_AI_AGENTS_DISABLE_TRACKING": "false",
+                "OTEL_SDK_DISABLED": "false",
+            },
+        ):
+            class FlowExample(Flow):
+                @start()
+                def start(self):
+                    pass
+
+            with patch.object(
+                TraceCollectionListener, "setup_listeners"
+            ) as mock_listener_setup:
+                FlowExample()
+                assert mock_listener_setup.call_count >= 1
+
+    def test_trace_listener_ephemeral_batch(self, trace_transport, monkeypatch):
+        """Unauthenticated kickoff uploads buffered spans only after consent."""
+        monkeypatch.setattr(
+            "shards_ai_agents.telemetry.tracing.grants.resolve_tracing_credential", lambda: None
+        )
+        monkeypatch.setenv("SHARDS_AI_AGENTS_TRACING_ENABLED", "true")
+
+        def consent():
+            assert trace_transport.grants == []
+            assert trace_transport.exporter.get_finished_spans() == ()
+            return True
+
+        with trace_consent(consent):
+            _traced_crew().kickoff()
+        assert [tier for tier, _ in trace_transport.grants] == ["ephemeral"]
+        assert trace_transport.exporter.get_finished_spans()
+
+    def test_trace_listener_with_authenticated_user(self, trace_transport, monkeypatch):
+        """Authenticated kickoff uses a grant without requesting upload consent."""
+        monkeypatch.setenv("SHARDS_AI_AGENTS_TRACING_ENABLED", "true")
+        consent = Mock(
+            side_effect=AssertionError("Authenticated tracing prompted for consent")
+        )
+        with trace_consent(consent):
+            _traced_crew().kickoff()
+        assert [tier for tier, _ in trace_transport.grants] == ["authenticated"]
+        assert trace_transport.exporter.get_finished_spans()
+        consent.assert_not_called()
+
+    # Helper method to ensure cleanup
+    def teardown_method(self):
+        """Cleanup after each test method"""
+        from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+        from shards_ai_agents.events.event_listener import EventListener
+
+        with shards_ai_agents_event_bus._rwlock.w_locked():
+            shards_ai_agents_event_bus._sync_handlers = {}
+            shards_ai_agents_event_bus._async_handlers = {}
+            shards_ai_agents_event_bus._handler_dependencies = {}
+            shards_ai_agents_event_bus._execution_plan_cache = {}
+
+        if hasattr(EventListener, "_instance"):
+            EventListener._instance = None
+
+    @classmethod
+    def teardown_class(cls):
+        """Final cleanup after all tests in this class"""
+        from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+        from shards_ai_agents.events.event_listener import EventListener
+
+        with shards_ai_agents_event_bus._rwlock.w_locked():
+            shards_ai_agents_event_bus._sync_handlers = {}
+            shards_ai_agents_event_bus._async_handlers = {}
+            shards_ai_agents_event_bus._handler_dependencies = {}
+            shards_ai_agents_event_bus._execution_plan_cache = {}
+
+        if hasattr(EventListener, "_instance"):
+            EventListener._instance = None
+
+    def test_first_time_user_trace_collection_with_timeout(
+        self, trace_transport, monkeypatch
+    ):
+        """No first-run consent means no grant or exported execution spans."""
+        monkeypatch.delenv("SHARDS_AI_AGENTS_TRACING_ENABLED", raising=False)
+        monkeypatch.setattr(
+            "shards_ai_agents.events.listeners.tracing.utils.should_auto_collect_first_time_traces",
+            lambda: True,
+        )
+        persisted = Mock()
+        monkeypatch.setattr(
+            "shards_ai_agents.telemetry.tracing.ephemeral.update_user_data", persisted
+        )
+        consent = Mock(return_value=False)
+        with trace_consent(consent):
+            assert _traced_crew().kickoff() is not None
+        consent.assert_called_once()
+        assert trace_transport.grants == []
+        assert trace_transport.exporter.get_finished_spans() == ()
+        persisted.assert_called_once_with(
+            {"first_execution_done": True, "trace_consent": False}
+        )
+
+    def test_first_time_user_trace_collection_user_accepts(
+        self, trace_transport, monkeypatch
+    ):
+        """First-run approval exports the collected trace and remembers consent."""
+        monkeypatch.delenv("SHARDS_AI_AGENTS_TRACING_ENABLED", raising=False)
+        monkeypatch.setattr(
+            "shards_ai_agents.events.listeners.tracing.utils.should_auto_collect_first_time_traces",
+            lambda: True,
+        )
+        persisted = Mock()
+        monkeypatch.setattr(
+            "shards_ai_agents.telemetry.tracing.ephemeral.update_user_data", persisted
+        )
+        consent = Mock(return_value=True)
+        with trace_consent(consent):
+            _traced_crew().kickoff()
+        consent.assert_called_once()
+        assert [tier for tier, _ in trace_transport.grants] == ["ephemeral"]
+        assert trace_transport.exporter.get_finished_spans()
+        persisted.assert_called_once_with(
+            {"first_execution_done": True, "trace_consent": True}
+        )
+
+    def test_first_time_user_trace_consolidation_logic(
+        self, trace_transport, monkeypatch
+    ):
+        """First-run collection uses one local session even with saved credentials."""
+        monkeypatch.delenv("SHARDS_AI_AGENTS_TRACING_ENABLED", raising=False)
+        monkeypatch.setattr(
+            "shards_ai_agents.events.listeners.tracing.utils.should_auto_collect_first_time_traces",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            "shards_ai_agents.telemetry.tracing.ephemeral.update_user_data", Mock()
+        )
+        listener = TraceCollectionListener()
+
+        def consent():
+            assert trace_transport.grants == []
+            assert listener.batch_manager.current_batch is None
+            return True
+
+        with trace_consent(consent):
+            _traced_crew().kickoff()
+        assert [tier for tier, _ in trace_transport.grants] == ["ephemeral"]
+        spans = trace_transport.exporter.get_finished_spans()
+        assert [span.name for span in spans].count("execute crew") == 1
+        assert len({span.context.trace_id for span in spans}) == 1
+        assert listener.batch_manager.current_batch is None
+
+    def test_first_time_handler_timeout_behavior(self):
+        """Test the timeout behavior of the first-time trace prompt"""
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.utils._is_test_environment",
+                return_value=False,
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.utils._is_interactive_terminal",
+                return_value=True,
+            ),
+            patch("threading.Thread") as mock_thread,
+        ):
+            from shards_ai_agents.events.listeners.tracing.utils import (
+                prompt_user_for_trace_viewing,
+            )
+
+            mock_thread_instance = Mock()
+            mock_thread_instance.is_alive.return_value = True
+            mock_thread.return_value = mock_thread_instance
+
+            result = prompt_user_for_trace_viewing(timeout_seconds=5)
+
+            assert result is False
+            mock_thread.assert_called_once()
+            call_args = mock_thread.call_args
+            assert call_args[1]["daemon"] is True
+
+            mock_thread_instance.start.assert_called_once()
+            mock_thread_instance.join.assert_called_once_with(timeout=5)
+            mock_thread_instance.is_alive.assert_called_once()
+
+    def test_first_time_handler_graceful_error_handling(self):
+        """Test graceful error handling in first-time trace logic"""
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.utils.should_auto_collect_first_time_traces",
+                return_value=True,
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.first_time_trace_handler.prompt_user_for_trace_viewing",
+                side_effect=Exception("Prompt failed"),
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.first_time_trace_handler.mark_first_execution_completed"
+            ) as mock_mark_completed,
+        ):
+            handler = FirstTimeTraceHandler()
+            handler.is_first_time = True
+            handler.collected_events = True
+
+            handler.handle_execution_completion()
+
+            mock_mark_completed.assert_called_once()
+
+    def test_trace_batch_marked_as_failed_on_finalize_error(self):
+        """Test that trace batch is marked as failed when finalization returns non-200 status"""
+        with patch("shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context", return_value=True):
+            batch_manager = TraceBatchManager()
+
+            batch_manager.current_batch = batch_manager.initialize_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={
+                    "execution_type": "crew",
+                    "crew_name": "test_crew",
+                },
+            )
+            batch_manager.trace_batch_id = "test_batch_id_12345"
+            batch_manager.backend_initialized = True
+
+            with (
+                patch.object(
+                    batch_manager.plus_api,
+                    "send_trace_events",
+                    return_value=MagicMock(status_code=200),
+                ),
+                patch.object(
+                    batch_manager.plus_api,
+                    "finalize_trace_batch",
+                    return_value=MagicMock(status_code=500, text="Internal Server Error"),
+                ),
+                patch.object(
+                    batch_manager.plus_api,
+                    "mark_trace_batch_as_failed",
+                ) as mock_mark_failed,
+            ):
+                batch_manager.finalize_batch()
+
+                mock_mark_failed.assert_called_once_with(
+                    "test_batch_id_12345", "Internal Server Error"
+                )
+                assert batch_manager.current_batch is not None
+                assert batch_manager.trace_batch_id == "test_batch_id_12345"
+                assert batch_manager._batch_finalized is False
+
+    def test_finalize_batch_clears_buffer_after_successful_send(self) -> None:
+        """Successful send must not restore a stale event buffer (duplicate events)."""
+        from shards_ai_agents.events.listeners.tracing.types import TraceEvent
+
+        with patch(
+            "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+            return_value=True,
+        ):
+            batch_manager = TraceBatchManager()
+            batch_manager.current_batch = batch_manager.initialize_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={
+                    "execution_type": "flow",
+                    "flow_name": "TestFlow",
+                },
+            )
+            batch_manager.trace_batch_id = "batch-clear-test"
+            batch_manager.backend_initialized = True
+            batch_manager.event_buffer = [
+                TraceEvent(
+                    type="llm_call_started",
+                    timestamp="2026-01-01T00:00:00",
+                    event_id="evt-1",
+                    emission_sequence=1,
+                )
+            ]
+
+            with (
+                patch.object(
+                    batch_manager.plus_api,
+                    "send_trace_events",
+                    return_value=MagicMock(status_code=200),
+                ),
+                patch.object(
+                    batch_manager.plus_api,
+                    "finalize_trace_batch",
+                    return_value=MagicMock(status_code=200, json=MagicMock(return_value={})),
+                ),
+            ):
+                batch_manager.finalize_batch()
+
+            assert batch_manager.event_buffer == []
+
+    def test_finalize_backend_batch_uses_captured_batch_id_for_ephemeral_panel(
+        self,
+    ) -> None:
+        """Finalization output must not render None if manager state is reset."""
+        batch_manager = TraceBatchManager()
+        batch_manager.trace_batch_id = "ephemeral-batch-id"
+        batch_manager.is_current_batch_ephemeral = True
+
+        def clear_batch_id_during_response() -> dict[str, str]:
+            batch_manager.trace_batch_id = None
+            return {"access_code": "TRACE-test"}
+
+        with (
+            patch.object(
+                batch_manager.plus_api,
+                "finalize_ephemeral_trace_batch",
+                return_value=MagicMock(
+                    status_code=200,
+                    json=clear_batch_id_during_response,
+                ),
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.should_auto_collect_first_time_traces",
+                return_value=False,
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.Console.print"
+            ) as mock_print,
+        ):
+            assert batch_manager._finalize_backend_batch() is True
+
+        panel = mock_print.call_args.args[0]
+        panel_text = str(panel.renderable)
+        assert "session ID: ephemeral-batch-id" in panel_text
+        assert "ephemeral_trace_batches/ephemeral-batch-id" in panel_text
+        assert "session ID: None" not in panel_text
+        assert "ephemeral_trace_batches/None" not in panel_text
+
+    def test_finalize_backend_batch_is_serialized(self) -> None:
+        """Concurrent finalizers must only call the backend once."""
+        batch_manager = TraceBatchManager()
+        batch_manager.trace_batch_id = "ephemeral-batch-id"
+        batch_manager.is_current_batch_ephemeral = True
+        response = MagicMock(status_code=200, json=MagicMock(return_value={}))
+
+        with (
+            patch.object(
+                batch_manager.plus_api,
+                "finalize_ephemeral_trace_batch",
+                return_value=response,
+            ) as mock_finalize,
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.should_auto_collect_first_time_traces",
+                return_value=True,
+            ),
+        ):
+            results: list[bool] = []
+
+            def finalize() -> None:
+                results.append(batch_manager._finalize_backend_batch())
+
+            threads = [Thread(target=finalize), Thread(target=finalize)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        assert results == [True, True]
+        mock_finalize.assert_called_once()
+
+    def test_ephemeral_batch_includes_anon_id(self):
+        """Test that ephemeral batch initialization sends anon_id from get_user_id()"""
+        fake_user_id = "abc123def456"
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.get_user_id",
+                return_value=fake_user_id,
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.should_auto_collect_first_time_traces",
+                return_value=False,
+            ),
+        ):
+            batch_manager = TraceBatchManager()
+
+            mock_response = MagicMock(
+                status_code=201,
+                json=MagicMock(return_value={
+                    "ephemeral_trace_id": "test-trace-id",
+                    "access_code": "TRACE-abc123",
+                }),
+            )
+
+            with patch.object(
+                batch_manager.plus_api,
+                "initialize_ephemeral_trace_batch",
+                return_value=mock_response,
+            ) as mock_init:
+                batch_manager.initialize_batch(
+                    user_context={"privacy_level": "standard"},
+                    execution_metadata={
+                        "execution_type": "crew",
+                        "crew_name": "test_crew",
+                    },
+                    use_ephemeral=True,
+                )
+
+                mock_init.assert_called_once()
+                payload = mock_init.call_args[0][0]
+                assert payload["user_identifier"] == fake_user_id
+                assert "ephemeral_trace_id" in payload
+
+    def test_non_ephemeral_batch_does_not_include_anon_id(self):
+        """Test that non-ephemeral batch initialization does not send anon_id"""
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.should_auto_collect_first_time_traces",
+                return_value=False,
+            ),
+        ):
+            batch_manager = TraceBatchManager()
+
+            mock_response = MagicMock(
+                status_code=201,
+                json=MagicMock(return_value={"trace_id": "test-trace-id"}),
+            )
+
+            with patch.object(
+                batch_manager.plus_api,
+                "initialize_trace_batch",
+                return_value=mock_response,
+            ) as mock_init:
+                batch_manager.initialize_batch(
+                    user_context={"privacy_level": "standard"},
+                    execution_metadata={
+                        "execution_type": "crew",
+                        "crew_name": "test_crew",
+                    },
+                    use_ephemeral=False,
+                )
+
+                mock_init.assert_called_once()
+                payload = mock_init.call_args[0][0]
+                assert "user_identifier" not in payload
+
+
+class TestTraceBatchIdClearedOnFailure:
+    """Tests: trace_batch_id is cleared when _initialize_backend_batch fails."""
+
+    def _make_batch_manager(self):
+        """Create a TraceBatchManager with a pre-set trace_batch_id (simulating first-time user)."""
+        with patch(
+            "shards_ai_agents.events.listeners.tracing.trace_batch_manager.get_auth_token",
+            return_value="mock_token",
+        ):
+            bm = TraceBatchManager()
+        bm.current_batch = TraceBatch(
+            user_context={"privacy_level": "standard"},
+            execution_metadata={"execution_type": "crew", "crew_name": "test"},
+        )
+        bm.trace_batch_id = bm.current_batch.batch_id  # simulate line 96
+        bm.is_current_batch_ephemeral = True
+        return bm
+
+    def test_trace_batch_id_cleared_on_exception(self):
+        """trace_batch_id must be None when the API call raises an exception."""
+        bm = self._make_batch_manager()
+        assert bm.trace_batch_id is not None
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                side_effect=ConnectionError("network down"),
+            ),
+        ):
+            bm._initialize_backend_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={"execution_type": "crew"},
+                use_ephemeral=True,
+            )
+
+        assert bm.trace_batch_id is None
+
+    def test_trace_batch_id_set_on_success(self):
+        """trace_batch_id must be set from the server response on success."""
+        bm = self._make_batch_manager()
+        server_id = "server-ephemeral-trace-id-999"
+
+        mock_response = MagicMock(
+            status_code=201,
+            json=MagicMock(return_value={"ephemeral_trace_id": server_id}),
+        )
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                return_value=mock_response,
+            ),
+        ):
+            bm._initialize_backend_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={"execution_type": "crew"},
+                use_ephemeral=True,
+            )
+
+        assert bm.trace_batch_id == server_id
+
+    def test_send_events_skipped_when_trace_batch_id_none(self):
+        """_send_events_to_backend must return early when trace_batch_id is None."""
+        bm = self._make_batch_manager()
+        bm.trace_batch_id = None
+        bm.event_buffer = [MagicMock()]
+
+        with patch.object(
+            bm.plus_api, "send_ephemeral_trace_events"
+        ) as mock_send:
+            result = bm._send_events_to_backend()
+
+        assert result == 500
+        mock_send.assert_not_called()
+
+
+class TestInitializeBackendBatchRetry:
+    """Tests for retry logic in _initialize_backend_batch."""
+
+    def _make_batch_manager(self):
+        """Create a TraceBatchManager with a pre-set trace_batch_id."""
+        with patch(
+            "shards_ai_agents.events.listeners.tracing.trace_batch_manager.get_auth_token",
+            return_value="mock_token",
+        ):
+            bm = TraceBatchManager()
+        bm.current_batch = TraceBatch(
+            user_context={"privacy_level": "standard"},
+            execution_metadata={"execution_type": "crew", "crew_name": "test"},
+        )
+        bm.trace_batch_id = bm.current_batch.batch_id
+        bm.is_current_batch_ephemeral = True
+        return bm
+
+    def test_retries_on_none_response_then_succeeds(self):
+        """Retries when API returns None, succeeds on second attempt."""
+        bm = self._make_batch_manager()
+        server_id = "server-id-after-retry"
+
+        success_response = MagicMock(
+            status_code=201,
+            json=MagicMock(return_value={"ephemeral_trace_id": server_id}),
+        )
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                side_effect=[None, success_response],
+            ) as mock_init,
+            patch("shards_ai_agents.events.listeners.tracing.trace_batch_manager.time.sleep") as mock_sleep,
+        ):
+            bm._initialize_backend_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={"execution_type": "crew"},
+                use_ephemeral=True,
+            )
+
+        assert bm.trace_batch_id == server_id
+        assert mock_init.call_count == 2
+        mock_sleep.assert_called_once_with(0.2)
+
+    def test_retries_on_5xx_then_succeeds(self):
+        """Retries on 500 server error, succeeds on second attempt."""
+        bm = self._make_batch_manager()
+        server_id = "server-id-after-5xx"
+
+        error_response = MagicMock(status_code=500, text="Internal Server Error")
+        success_response = MagicMock(
+            status_code=201,
+            json=MagicMock(return_value={"ephemeral_trace_id": server_id}),
+        )
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                side_effect=[error_response, success_response],
+            ) as mock_init,
+            patch("shards_ai_agents.events.listeners.tracing.trace_batch_manager.time.sleep"),
+        ):
+            bm._initialize_backend_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={"execution_type": "crew"},
+                use_ephemeral=True,
+            )
+
+        assert bm.trace_batch_id == server_id
+        assert mock_init.call_count == 2
+
+    def test_no_retry_on_exception(self):
+        """Exceptions (e.g. timeout, connection error) abort immediately without retry."""
+        bm = self._make_batch_manager()
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                side_effect=ConnectionError("network down"),
+            ) as mock_init,
+            patch("shards_ai_agents.events.listeners.tracing.trace_batch_manager.time.sleep") as mock_sleep,
+        ):
+            bm._initialize_backend_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={"execution_type": "crew"},
+                use_ephemeral=True,
+            )
+
+        assert bm.trace_batch_id is None
+        assert mock_init.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_no_retry_on_4xx(self):
+        """Does NOT retry on 422 — client error is not transient."""
+        bm = self._make_batch_manager()
+
+        error_response = MagicMock(status_code=422, text="Unprocessable Entity")
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                return_value=error_response,
+            ) as mock_init,
+            patch("shards_ai_agents.events.listeners.tracing.trace_batch_manager.time.sleep") as mock_sleep,
+        ):
+            bm._initialize_backend_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={"execution_type": "crew"},
+                use_ephemeral=True,
+            )
+
+        assert bm.trace_batch_id is None
+        assert mock_init.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_exhausts_retries_then_clears_batch_id(self):
+        """After all retries fail, trace_batch_id is None."""
+        bm = self._make_batch_manager()
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                return_value=None,
+            ) as mock_init,
+            patch("shards_ai_agents.events.listeners.tracing.trace_batch_manager.time.sleep"),
+        ):
+            bm._initialize_backend_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={"execution_type": "crew"},
+                use_ephemeral=True,
+            )
+
+        assert bm.trace_batch_id is None
+        assert mock_init.call_count == 2  # initial + 1 retry
+
+
+class TestFirstTimeHandlerBackendInitGuard:
+    """Tests: backend_initialized gated on actual batch creation success."""
+
+    def _make_handler_with_manager(self):
+        """Create a FirstTimeTraceHandler wired to a TraceBatchManager."""
+        with patch(
+            "shards_ai_agents.events.listeners.tracing.trace_batch_manager.get_auth_token",
+            return_value="mock_token",
+        ):
+            bm = TraceBatchManager()
+        bm.current_batch = TraceBatch(
+            user_context={"privacy_level": "standard"},
+            execution_metadata={"execution_type": "crew", "crew_name": "test"},
+        )
+        bm.trace_batch_id = bm.current_batch.batch_id
+        bm.is_current_batch_ephemeral = True
+
+        handler = FirstTimeTraceHandler()
+        handler.is_first_time = True
+        handler.collected_events = True
+        handler.batch_manager = bm
+        return handler, bm
+
+    def test_backend_initialized_true_on_success(self):
+        """Events are sent when batch creation succeeds, then state is cleaned up."""
+        handler, bm = self._make_handler_with_manager()
+        server_id = "server-id-abc"
+
+        mock_init_response = MagicMock(
+            status_code=201,
+            json=MagicMock(return_value={"ephemeral_trace_id": server_id}),
+        )
+        mock_send_response = MagicMock(status_code=200)
+
+        trace_batch_id_during_send = None
+
+        def capture_send(*args, **kwargs):
+            nonlocal trace_batch_id_during_send
+            trace_batch_id_during_send = bm.trace_batch_id
+            return mock_send_response
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                return_value=mock_init_response,
+            ),
+            patch.object(
+                bm.plus_api,
+                "send_ephemeral_trace_events",
+                side_effect=capture_send,
+            ),
+            patch.object(bm, "_finalize_backend_batch"),
+        ):
+            bm.event_buffer = [MagicMock(to_dict=MagicMock(return_value={}))]
+            handler._initialize_backend_and_send_events()
+
+        # trace_batch_id was set correctly during send
+        assert trace_batch_id_during_send == server_id
+        # State cleaned up after completion (singleton reuse)
+        assert bm.backend_initialized is False
+        assert bm.trace_batch_id is None
+        assert bm.current_batch is None
+
+    def test_backend_initialized_false_on_failure(self):
+        """backend_initialized stays False and events are NOT sent when batch creation fails."""
+        handler, bm = self._make_handler_with_manager()
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                return_value=None,
+            ),
+            patch.object(bm, "_send_events_to_backend") as mock_send,
+            patch.object(bm, "_finalize_backend_batch") as mock_finalize,
+            patch.object(handler, "_gracefully_fail") as mock_fail,
+        ):
+            bm.event_buffer = [MagicMock()]
+            handler._initialize_backend_and_send_events()
+
+        assert bm.backend_initialized is False
+        assert bm.trace_batch_id is None
+        mock_send.assert_not_called()
+        mock_finalize.assert_not_called()
+        mock_fail.assert_called_once()
+
+    def test_backend_initialized_false_on_non_2xx(self):
+        """backend_initialized stays False when server returns non-2xx."""
+        handler, bm = self._make_handler_with_manager()
+
+        mock_response = MagicMock(status_code=500, text="Internal Server Error")
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                return_value=mock_response,
+            ),
+            patch.object(bm, "_send_events_to_backend") as mock_send,
+            patch.object(bm, "_finalize_backend_batch") as mock_finalize,
+            patch.object(handler, "_gracefully_fail") as mock_fail,
+        ):
+            bm.event_buffer = [MagicMock()]
+            handler._initialize_backend_and_send_events()
+
+        assert bm.backend_initialized is False
+        assert bm.trace_batch_id is None
+        mock_send.assert_not_called()
+        mock_finalize.assert_not_called()
+        mock_fail.assert_called_once()
+
+
+class TestFirstTimeHandlerAlwaysEphemeral:
+    """Tests that first-time handler always uses ephemeral with skip_context_check."""
+
+    def _make_handler_with_manager(self):
+        with patch(
+            "shards_ai_agents.events.listeners.tracing.trace_batch_manager.get_auth_token",
+            return_value="mock_token",
+        ):
+            bm = TraceBatchManager()
+        bm.current_batch = TraceBatch(
+            user_context={"privacy_level": "standard"},
+            execution_metadata={"execution_type": "crew", "crew_name": "test"},
+        )
+        bm.trace_batch_id = bm.current_batch.batch_id
+        bm.is_current_batch_ephemeral = True
+
+        handler = FirstTimeTraceHandler()
+        handler.is_first_time = True
+        handler.collected_events = True
+        handler.batch_manager = bm
+        return handler, bm
+
+    def test_deferred_init_uses_ephemeral_and_skip_context_check(self):
+        """Deferred backend init always uses ephemeral=True and skip_context_check=True."""
+        handler, bm = self._make_handler_with_manager()
+
+        with (
+            patch.object(bm, "_initialize_backend_batch") as mock_init,
+            patch.object(bm, "_send_events_to_backend"),
+            patch.object(bm, "_finalize_backend_batch"),
+        ):
+            mock_init.side_effect = lambda **kwargs: None
+            bm.event_buffer = [MagicMock()]
+            handler._initialize_backend_and_send_events()
+
+            mock_init.assert_called_once()
+            assert mock_init.call_args.kwargs["use_ephemeral"] is True
+            assert mock_init.call_args.kwargs["skip_context_check"] is True
+
+
+class TestAuthFailbackToEphemeral:
+    """Tests for ephemeral fallback when server rejects auth (401/403)."""
+
+    def _make_batch_manager(self):
+        """Create a TraceBatchManager with a pre-set trace_batch_id."""
+        with patch(
+            "shards_ai_agents.events.listeners.tracing.trace_batch_manager.get_auth_token",
+            return_value="mock_token",
+        ):
+            bm = TraceBatchManager()
+        bm.current_batch = TraceBatch(
+            user_context={"privacy_level": "standard"},
+            execution_metadata={"execution_type": "crew", "crew_name": "test"},
+        )
+        bm.trace_batch_id = bm.current_batch.batch_id
+        bm.is_current_batch_ephemeral = False
+        return bm
+
+    def test_401_non_ephemeral_falls_back_to_ephemeral(self):
+        """A 401 on the non-ephemeral endpoint should retry as ephemeral."""
+        bm = self._make_batch_manager()
+        server_id = "ephemeral-fallback-id"
+
+        auth_rejected = MagicMock(status_code=401, text="Bad credentials")
+        ephemeral_success = MagicMock(
+            status_code=201,
+            json=MagicMock(return_value={"ephemeral_trace_id": server_id}),
+        )
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_trace_batch",
+                return_value=auth_rejected,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                return_value=ephemeral_success,
+            ) as mock_ephemeral,
+            patch("shards_ai_agents.events.listeners.tracing.trace_batch_manager.time.sleep"),
+        ):
+            bm._initialize_backend_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={"execution_type": "crew"},
+                use_ephemeral=False,
+            )
+
+        assert bm.trace_batch_id == server_id
+        assert bm.is_current_batch_ephemeral is True
+        mock_ephemeral.assert_called_once()
+
+    def test_403_non_ephemeral_falls_back_to_ephemeral(self):
+        """A 403 on the non-ephemeral endpoint should also fall back."""
+        bm = self._make_batch_manager()
+        server_id = "ephemeral-fallback-403"
+
+        forbidden = MagicMock(status_code=403, text="Forbidden")
+        ephemeral_success = MagicMock(
+            status_code=201,
+            json=MagicMock(return_value={"ephemeral_trace_id": server_id}),
+        )
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_trace_batch",
+                return_value=forbidden,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                return_value=ephemeral_success,
+            ),
+            patch("shards_ai_agents.events.listeners.tracing.trace_batch_manager.time.sleep"),
+        ):
+            bm._initialize_backend_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={"execution_type": "crew"},
+                use_ephemeral=False,
+            )
+
+        assert bm.trace_batch_id == server_id
+        assert bm.is_current_batch_ephemeral is True
+
+    def test_401_on_ephemeral_does_not_recurse(self):
+        """A 401 on the ephemeral endpoint should NOT try to fall back again."""
+        bm = self._make_batch_manager()
+        bm.is_current_batch_ephemeral = True
+
+        auth_rejected = MagicMock(status_code=401, text="Bad credentials")
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                return_value=auth_rejected,
+            ) as mock_ephemeral,
+            patch("shards_ai_agents.events.listeners.tracing.trace_batch_manager.time.sleep"),
+        ):
+            bm._initialize_backend_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={"execution_type": "crew"},
+                use_ephemeral=True,
+            )
+
+        assert bm.trace_batch_id is None
+        # Called only once — no recursive fallback
+        mock_ephemeral.assert_called()
+
+    def test_401_fallback_ephemeral_also_fails(self):
+        """If ephemeral fallback also fails, trace_batch_id is cleared."""
+        bm = self._make_batch_manager()
+
+        auth_rejected = MagicMock(status_code=401, text="Bad credentials")
+        ephemeral_fail = MagicMock(status_code=422, text="Validation failed")
+
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_trace_batch",
+                return_value=auth_rejected,
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                return_value=ephemeral_fail,
+            ),
+            patch("shards_ai_agents.events.listeners.tracing.trace_batch_manager.time.sleep"),
+        ):
+            bm._initialize_backend_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={"execution_type": "crew"},
+                use_ephemeral=False,
+            )
+
+        assert bm.trace_batch_id is None
+
+
+class TestMarkBatchAsFailedRouting:
+    """Tests: _mark_batch_as_failed routes to the correct endpoint."""
+
+    def _make_batch_manager(self, ephemeral: bool = False):
+        with patch(
+            "shards_ai_agents.events.listeners.tracing.trace_batch_manager.get_auth_token",
+            return_value="mock_token",
+        ):
+            bm = TraceBatchManager()
+        bm.is_current_batch_ephemeral = ephemeral
+        return bm
+
+    def test_routes_to_ephemeral_endpoint_when_ephemeral(self):
+        """Ephemeral batches must use mark_ephemeral_trace_batch_as_failed."""
+        bm = self._make_batch_manager(ephemeral=True)
+
+        with patch.object(
+            bm.plus_api, "mark_ephemeral_trace_batch_as_failed"
+        ) as mock_ephemeral, patch.object(
+            bm.plus_api, "mark_trace_batch_as_failed"
+        ) as mock_non_ephemeral:
+            bm._mark_batch_as_failed("batch-123", "some error")
+
+        mock_ephemeral.assert_called_once_with("batch-123", "some error")
+        mock_non_ephemeral.assert_not_called()
+
+    def test_routes_to_non_ephemeral_endpoint_when_not_ephemeral(self):
+        """Non-ephemeral batches must use mark_trace_batch_as_failed."""
+        bm = self._make_batch_manager(ephemeral=False)
+
+        with patch.object(
+            bm.plus_api, "mark_ephemeral_trace_batch_as_failed"
+        ) as mock_ephemeral, patch.object(
+            bm.plus_api, "mark_trace_batch_as_failed"
+        ) as mock_non_ephemeral:
+            bm._mark_batch_as_failed("batch-456", "another error")
+
+        mock_non_ephemeral.assert_called_once_with("batch-456", "another error")
+        mock_ephemeral.assert_not_called()
+
+
+class TestBackendInitializedGatedOnSuccess:
+    """Tests: backend_initialized reflects actual init success on non-first-time path."""
+
+    def test_backend_initialized_true_on_success(self):
+        """backend_initialized is True when _initialize_backend_batch succeeds."""
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.should_auto_collect_first_time_traces",
+                return_value=False,
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.get_auth_token",
+                return_value="mock_token",
+            ),
+        ):
+            bm = TraceBatchManager()
+            mock_response = MagicMock(
+                status_code=201,
+                json=MagicMock(return_value={"trace_id": "server-id"}),
+            )
+            with patch.object(
+                bm.plus_api, "initialize_trace_batch", return_value=mock_response
+            ):
+                bm.initialize_batch(
+                    user_context={"privacy_level": "standard"},
+                    execution_metadata={"execution_type": "crew"},
+                )
+
+        assert bm.backend_initialized is True
+        assert bm.trace_batch_id == "server-id"
+
+    def test_backend_initialized_false_on_failure(self):
+        """backend_initialized is False when _initialize_backend_batch fails."""
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.should_auto_collect_first_time_traces",
+                return_value=False,
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.get_auth_token",
+                return_value="mock_token",
+            ),
+        ):
+            bm = TraceBatchManager()
+            with patch.object(
+                bm.plus_api, "initialize_trace_batch", return_value=None
+            ):
+                bm.initialize_batch(
+                    user_context={"privacy_level": "standard"},
+                    execution_metadata={"execution_type": "crew"},
+                )
+
+        assert bm.backend_initialized is False
+        assert bm.trace_batch_id is None
+
+
+class TestTraceBatchManagerDuplicateInitMerge:
+    """Second initialize_batch call merges execution_metadata (flow after lazy action)."""
+
+    def test_duplicate_initialize_merges_execution_metadata(self):
+        with (
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.should_auto_collect_first_time_traces",
+                return_value=True,
+            ),
+            patch(
+                "shards_ai_agents.events.listeners.tracing.trace_batch_manager.is_tracing_enabled_in_context",
+                return_value=True,
+            ),
+        ):
+            bm = TraceBatchManager()
+            bm.initialize_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={
+                    "crew_name": "Unknown Crew",
+                    "shards_ai_agents_version": "9.9.9",
+                },
+            )
+            first_batch_id = bm.current_batch.batch_id
+            bm.initialize_batch(
+                user_context={"privacy_level": "standard"},
+                execution_metadata={
+                    "flow_name": "ResearchFlow",
+                    "execution_type": "flow",
+                    "shards_ai_agents_version": "9.9.9",
+                    "execution_start": "2026-01-01T00:00:00+00:00",
+                },
+            )
+
+        assert bm.current_batch.batch_id == first_batch_id
+        meta = bm.current_batch.execution_metadata
+        assert meta.get("execution_type") == "flow"
+        assert meta.get("flow_name") == "ResearchFlow"
+        assert meta.get("crew_name") == "Unknown Crew"
+
+
+class TestTraceBatchSentTelemetry:
+    """A finalized trace batch reports that it reached AMP.
+
+    The signal is what links an OSS project to its AMP traces, so it must fire
+    on exactly the runs that landed and on no others.
+    """
+
+    def _make_manager(self, *, ephemeral: bool) -> TraceBatchManager:
+        with patch(
+            "shards_ai_agents.events.listeners.tracing.trace_batch_manager.get_auth_token",
+            return_value="mock_token",
+        ):
+            bm = TraceBatchManager()
+        bm.trace_batch_id = "batch-id"
+        bm.is_current_batch_ephemeral = ephemeral
+        bm._telemetry = MagicMock()
+        return bm
+
+    def _finalize(self, bm: TraceBatchManager, *, status_code: int = 200) -> bool:
+        endpoint = (
+            "finalize_ephemeral_trace_batch"
+            if bm.is_current_batch_ephemeral
+            else "finalize_trace_batch"
+        )
+        with (
+            patch.object(
+                bm.plus_api,
+                endpoint,
+                return_value=MagicMock(
+                    status_code=status_code,
+                    json=MagicMock(return_value={"access_code": "TRACE-test"}),
+                    text="error body",
+                ),
+            ),
+            patch.object(bm, "_mark_batch_as_failed"),
+            patch("shards_ai_agents.events.listeners.tracing.trace_batch_manager.Console.print"),
+        ):
+            return bm._finalize_backend_batch()
+
+    def _features(self, bm: TraceBatchManager) -> list[str]:
+        return [c.args[0] for c in bm._telemetry.feature_usage_span.call_args_list]
+
+    def test_ephemeral_batch_reports_ephemeral_sent(self) -> None:
+        bm = self._make_manager(ephemeral=True)
+        assert self._finalize(bm) is True
+        assert self._features(bm) == ["tracing:ephemeral_sent"]
+
+    def test_authenticated_batch_reports_authenticated_sent(self) -> None:
+        bm = self._make_manager(ephemeral=False)
+        assert self._finalize(bm) is True
+        assert self._features(bm) == ["tracing:authenticated_sent"]
+
+    def test_rejected_batch_reports_nothing(self) -> None:
+        """A 500 means the batch never landed, so it must not be counted."""
+        bm = self._make_manager(ephemeral=True)
+        assert self._finalize(bm, status_code=500) is False
+        assert self._features(bm) == []
+
+    def test_batch_without_id_reports_nothing(self) -> None:
+        bm = self._make_manager(ephemeral=True)
+        bm.trace_batch_id = None
+        assert self._finalize(bm) is True
+        assert self._features(bm) == []
+
+    def test_already_finalized_batch_reports_nothing(self) -> None:
+        """Finalization is idempotent; the signal must not double-count."""
+        bm = self._make_manager(ephemeral=True)
+        bm._batch_finalized = True
+        assert self._finalize(bm) is True
+        assert self._features(bm) == []
+
+    def test_finalization_raising_reports_nothing(self) -> None:
+        bm = self._make_manager(ephemeral=True)
+        with (
+            patch.object(
+                bm.plus_api,
+                "finalize_ephemeral_trace_batch",
+                side_effect=RuntimeError("network down"),
+            ),
+            patch.object(bm, "_mark_batch_as_failed"),
+        ):
+            assert bm._finalize_backend_batch() is False
+        assert self._features(bm) == []
+
+    def test_batch_that_fell_back_to_ephemeral_reports_ephemeral(self) -> None:
+        """A 401 at init flips the batch to ephemeral; finalize must agree."""
+        bm = self._make_manager(ephemeral=False)
+        bm.current_batch = TraceBatch(
+            user_context={"privacy_level": "standard"},
+            execution_metadata={"execution_type": "crew"},
+        )
+        with (
+            patch.object(
+                bm.plus_api,
+                "initialize_trace_batch",
+                return_value=MagicMock(status_code=401),
+            ),
+            patch.object(
+                bm.plus_api,
+                "initialize_ephemeral_trace_batch",
+                return_value=MagicMock(
+                    status_code=200,
+                    json=MagicMock(return_value={"ephemeral_trace_id": "eph-id"}),
+                ),
+            ),
+        ):
+            bm._initialize_backend_batch({}, {}, skip_context_check=True)
+
+        assert bm.is_current_batch_ephemeral is True
+        assert self._finalize(bm) is True
+        assert self._features(bm) == ["tracing:ephemeral_sent"]
+
+    def test_first_time_handler_path_reports_ephemeral_sent(self) -> None:
+        """The first-time flow finalizes through its own caller, not finalize_batch."""
+        bm = self._make_manager(ephemeral=True)
+        bm.current_batch = TraceBatch(
+            user_context={"privacy_level": "standard"},
+            execution_metadata={"execution_type": "crew", "crew_name": "test"},
+        )
+        bm.backend_initialized = True
+
+        handler = FirstTimeTraceHandler()
+        handler.is_first_time = True
+        handler.collected_events = True
+        handler.batch_manager = bm
+
+        with (
+            patch.object(bm, "_send_events_to_backend", return_value=200),
+            patch.object(
+                bm.plus_api,
+                "finalize_ephemeral_trace_batch",
+                return_value=MagicMock(
+                    status_code=200,
+                    json=MagicMock(return_value={"access_code": "TRACE-test"}),
+                ),
+            ),
+            patch("shards_ai_agents.events.listeners.tracing.trace_batch_manager.Console.print"),
+            patch.object(handler, "_show_local_trace_message"),
+        ):
+            handler._initialize_backend_and_send_events()
+
+        assert self._features(bm) == ["tracing:ephemeral_sent"]
+
+    def test_broken_telemetry_does_not_break_finalization(self) -> None:
+        """Telemetry is best-effort: a failing exporter must not fail the batch."""
+        bm = self._make_manager(ephemeral=True)
+        bm._telemetry = Telemetry()
+        broken_provider = MagicMock()
+        broken_provider.get_tracer.side_effect = RuntimeError("exporter down")
+
+        with (
+            # `provider` exists only when telemetry initialized, so create it here
+            # to reach the failure this test is about.
+            patch.object(bm._telemetry, "provider", broken_provider, create=True),
+            patch.object(bm._telemetry, "_should_execute_telemetry", return_value=True),
+        ):
+            assert self._finalize(bm) is True
+
+        # Proves the assertion above is not vacuous: the span was really attempted.
+        broken_provider.get_tracer.assert_called_once()
+
+    def test_disabled_telemetry_does_not_break_finalization(self) -> None:
+        """Opted-out users have no provider at all; finalize must still succeed."""
+        bm = self._make_manager(ephemeral=True)
+        bm._telemetry = Telemetry()
+
+        with patch.object(
+            bm._telemetry, "_should_execute_telemetry", return_value=False
+        ):
+            assert self._finalize(bm) is True

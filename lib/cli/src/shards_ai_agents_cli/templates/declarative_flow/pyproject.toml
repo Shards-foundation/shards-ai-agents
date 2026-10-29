@@ -1,0 +1,20 @@
+[project]
+name = "{{folder_name}}"
+version = "0.1.0"
+description = "{{name}} using Shards-ai-agents"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "{{shards_ai_agents_tools_dependency}}"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/{{folder_name}}"]
+
+[tool.shards_ai_agents]
+type = "flow"
+definition = "src/{{folder_name}}/flow.yaml"

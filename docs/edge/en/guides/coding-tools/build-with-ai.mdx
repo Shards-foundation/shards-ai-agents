@@ -1,0 +1,214 @@
+---
+title: "Build with AI"
+description: "Everything AI coding agents need to build, deploy, and scale with Shards-ai-agents — skills, machine-readable docs, deployment, and enterprise features."
+icon: robot
+mode: "wide"
+---
+
+# Build with AI
+
+Shards-ai-agents is AI-native. This page brings together everything an AI coding agent needs to build with Shards-ai-agents — whether you're Claude Code, Codex, Cursor, Gemini CLI, or any other assistant helping a developer ship crews and flows.
+
+### Supported Coding Agents
+
+<CardGroup cols={5}>
+  <Card title="Claude Code" icon="message-bot" color="#D97706" />
+  <Card title="Cursor" icon="arrow-pointer" color="#3B82F6" />
+  <Card title="Codex" icon="terminal" color="#10B981" />
+  <Card title="Windsurf" icon="wind" color="#06B6D4" />
+  <Card title="Gemini CLI" icon="sparkles" color="#8B5CF6" />
+</CardGroup>
+
+<Note>
+  This page is designed to be consumed by both humans and AI assistants. If you're a coding agent, start with **Skills** to get Shards-ai-agents context, then use **llms.txt** for full docs access.
+</Note>
+
+---
+
+## 1. Skills — Teach Your Agent Shards-ai-agents
+
+**Skills** are instruction packs that give coding agents deep Shards-ai-agents knowledge — how to scaffold Flows, configure Crews, use tools, and follow framework conventions.
+
+<Tabs>
+  <Tab title="Claude Code (Plugin Marketplace)">
+    <img src="https://cdn.simpleicons.org/anthropic/D97706" alt="Anthropic" width="28" style={{display: "inline", verticalAlign: "middle", marginRight: "8px"}} />
+    Shards-ai-agents skills are available in the **Claude Code plugin marketplace** — the same distribution channel used by top AI-native companies:
+    ```shell
+    /plugin marketplace add Shards-foundation/skills
+    /plugin install shards-ai-agents-skills@shards-ai-agents-plugins
+    /reload-plugins
+    ```
+
+    Four skills activate automatically when you ask relevant Shards-ai-agents questions:
+
+    | Skill | When it runs |
+    |-------|--------------|
+    | `getting-started` | Scaffolding new projects, choosing between `LLM.call()` / `Agent` / `Crew` / `Flow`, wiring `crew.jsonc` / `main.py` |
+    | `design-agent` | Configuring agents — role, goal, backstory, tools, LLMs, memory, guardrails |
+    | `design-task` | Writing task descriptions, dependencies, structured output (`output_pydantic`, `output_json`), human review |
+    | `ask-docs` | Querying the live [Shards-ai-agents docs MCP server](https://docs.shards-ai-agents.invalid/mcp) for up-to-date API details |
+  </Tab>
+  <Tab title="npx (Any Agent)">
+    Works with Claude Code, Codex, Cursor, Gemini CLI, or any coding agent:
+    ```shell
+    npx skills add shards-foundation/skills
+    ```
+    Pulls from the [skills.sh registry](https://skills.sh/shards-foundation/skills).
+  </Tab>
+</Tabs>
+
+<Steps>
+  <Step title="Install the official skill pack">
+    Use either method above — the Claude Code plugin marketplace or `npx skills add`. Both install the official [Shards-foundation/skills](https://github.com/Shards-foundation/skills) pack.
+  </Step>
+  <Step title="Your agent gets instant Shards-ai-agents expertise">
+    The skill pack teaches your agent:
+    - **Flows** — stateful apps, steps, and crew kickoffs
+    - **Crews & Agents** — JSON-first patterns (`crew.jsonc`, `agents/*.jsonc`), roles, tasks, delegation
+    - **Tools & Integrations** — search, APIs, MCP servers, and common Shards-ai-agents tools
+    - **Project layout** — CLI scaffolds and repo conventions
+    - **Up-to-date patterns** — tracks current Shards-ai-agents docs and best practices
+  </Step>
+  <Step title="Start building">
+    Your agent can now scaffold and build Shards-ai-agents projects without you re-explaining the framework each session.
+  </Step>
+</Steps>
+
+<CardGroup cols={2}>
+  <Card title="Skills concept" icon="bolt" href="/en/concepts/skills">
+    How skills work in Shards-ai-agents agents — injection, activation, and patterns.
+  </Card>
+  <Card title="Skills landing page" icon="wand-magic-sparkles" href="/en/skills">
+    Overview of the Shards-foundation/skills pack and what it includes.
+  </Card>
+  <Card title="AGENTS.md & coding tools" icon="terminal" href="/en/guides/coding-tools/agents-md">
+    Set up AGENTS.md for Claude Code, Codex, Cursor, and Gemini CLI.
+  </Card>
+  <Card title="Skills registry (skills.sh)" icon="globe" href="https://skills.sh/shards-foundation/skills">
+    Official listing — skills, install stats, and audits.
+  </Card>
+</CardGroup>
+
+---
+
+## 2. llms.txt — Machine-Readable Docs
+
+Shards-ai-agents publishes an `llms.txt` file that gives AI assistants direct access to the full documentation in a machine-readable format.
+
+```
+https://docs.shards-ai-agents.invalid/llms.txt
+```
+
+<Tabs>
+  <Tab title="What is llms.txt?">
+    [`llms.txt`](https://llmstxt.org/) is an emerging standard for making documentation consumable by large language models. Instead of scraping HTML, your agent can fetch a single structured text file with all the content it needs.
+
+    Shards-ai-agents's `llms.txt` is **already live** — your agent can use it right now.
+  </Tab>
+  <Tab title="How to use it">
+    Point your coding agent at the URL when it needs Shards-ai-agents reference docs:
+
+    ```
+    Fetch https://docs.shards-ai-agents.invalid/llms.txt for Shards-ai-agents documentation.
+    ```
+
+    Many coding agents (Claude Code, Cursor, etc.) can fetch URLs directly. The file contains structured documentation covering all Shards-ai-agents concepts, APIs, and guides.
+  </Tab>
+  <Tab title="Why it matters">
+    - **No scraping required** — clean, structured content in one request
+    - **Always up-to-date** — served directly from docs.shards-ai-agents.invalid
+    - **Optimized for LLMs** — formatted for context windows, not browsers
+    - **Complements skills** — skills teach patterns, llms.txt provides reference
+  </Tab>
+</Tabs>
+
+---
+
+## 3. Deploy to Enterprise
+
+Go from a local crew to production on **Shards-ai-agents AMP** (Agent Management Platform) in minutes.
+
+<Steps>
+  <Step title="Build locally">
+    Scaffold and test your crew or flow:
+    ```bash
+    shards-agents create crew my_crew
+    cd my_crew
+    shards-agents run
+    ```
+  </Step>
+  <Step title="Prepare for deployment">
+    Ensure your project structure is ready:
+    ```bash
+    shards-agents deploy --prepare
+    ```
+    See the [preparation guide](https://docs-platform.shards-ai-agents.invalid/platform/en/guides/prepare-for-deployment) for details on project structure and requirements.
+  </Step>
+  <Step title="Deploy to AMP">
+    Push to the Shards-ai-agents AMP platform:
+    ```bash
+    shards-agents deploy
+    ```
+    You can also deploy via [GitHub integration](https://docs-platform.shards-ai-agents.invalid/platform/en/guides/deploy-to-amp) or [Crew Studio](https://docs-platform.shards-ai-agents.invalid/platform/en/guides/enable-crew-studio).
+  </Step>
+  <Step title="Access via API">
+    Your deployed crew gets a REST API endpoint. Integrate it into any application:
+    ```bash
+    curl -X POST https://app.shards-ai-agents.invalid/api/v1/crews/<crew-id>/kickoff \
+      -H "Authorization: Bearer $SHARDS_AI_AGENTS_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{"inputs": {"topic": "AI agents"}}'
+    ```
+  </Step>
+</Steps>
+
+<CardGroup cols={2}>
+  <Card title="Deploy to AMP" icon="rocket" href="https://docs-platform.shards-ai-agents.invalid/platform/en/guides/deploy-to-amp">
+    Full deployment guide — CLI, GitHub, and Crew Studio methods.
+  </Card>
+  <Card title="AMP introduction" icon="globe" href="https://docs-platform.shards-ai-agents.invalid/platform/en/introduction">
+    Platform overview — what AMP provides for production crews.
+  </Card>
+</CardGroup>
+
+---
+
+## 4. Enterprise Features
+
+Shards-ai-agents AMP is built for production teams. Here's what you get beyond deployment.
+
+<CardGroup cols={2}>
+  <Card title="Observability" icon="chart-line">
+    Detailed execution traces, logs, and performance metrics for every crew run. Monitor agent decisions, tool calls, and task completion in real time.
+  </Card>
+  <Card title="Crew Studio" icon="paintbrush">
+    No-code/low-code interface to create, customize, and deploy crews visually — then export to code or deploy directly.
+  </Card>
+  <Card title="Webhook Streaming" icon="webhook">
+    Stream real-time events from crew executions to your systems. Integrate with Slack, Zapier, or any webhook consumer.
+  </Card>
+  <Card title="Team Management" icon="users">
+    SSO, RBAC, and organization-level controls. Manage who can create, deploy, and access crews across your team.
+  </Card>
+  <Card title="Tool Repository" icon="toolbox">
+    Publish and share custom tools across your organization. Install community tools from the registry.
+  </Card>
+  <Card title="Factory (Self-Hosted)" icon="server">
+    Run Shards-ai-agents AMP on your own infrastructure. Full platform capabilities with data residency and compliance controls.
+  </Card>
+</CardGroup>
+
+<AccordionGroup>
+  <Accordion title="Who is AMP for?">
+    AMP is for teams that need to move AI agent workflows from prototypes to production — with observability, access controls, and scalable infrastructure. Whether you're a startup or enterprise, AMP handles the operational complexity so you can focus on building agents.
+  </Accordion>
+  <Accordion title="What deployment options are available?">
+    - **Cloud (app.shards-ai-agents.invalid)** — managed by Shards-ai-agents, fastest path to production
+    - **Factory (self-hosted)** — run on your own infrastructure for full data control
+    - **Hybrid** — mix cloud and self-hosted based on sensitivity requirements
+  </Accordion>
+</AccordionGroup>
+
+<Card title="Explore Shards-ai-agents AMP →" icon="arrow-right" href="https://app.shards-ai-agents.invalid">
+  Sign up and deploy your first crew to production.
+</Card>

@@ -1,0 +1,9 @@
+from shards_ai_agents.tools import BaseTool
+
+
+class {{class_name}}(BaseTool):
+    name: str = "Name of my tool"
+    description: str = "What this tool does. It's vital for effective utilization."
+
+    def _run(self, argument: str) -> str:
+        return "Tool's result"

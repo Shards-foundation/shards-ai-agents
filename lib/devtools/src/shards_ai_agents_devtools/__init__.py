@@ -1,0 +1,3 @@
+"""Shards-ai-agents development tools."""
+
+__version__ = "1.15.33"

@@ -1,0 +1,538 @@
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock, call, patch
+
+import pytest
+import httpx
+from shards_ai_agents_cli.authentication.main import AuthenticationCommand
+from shards_ai_agents_cli.constants import (
+    SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_AUDIENCE,
+    SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_CLIENT_ID,
+    SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_DOMAIN,
+)
+
+
+class _FakeClock:
+    """Stands in for ``time`` in the OAuth2 module: sleeping advances ``monotonic``."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def fake_clock():
+    clock = _FakeClock()
+    with patch("shards_ai_agents_core.auth.oauth2.time", clock):
+        yield clock
+
+
+def _token_response(status_code: int, body: dict[str, str]) -> MagicMock:
+    response = MagicMock()
+    response.status_code = status_code
+    response.json.return_value = body
+    return response
+
+
+class TestAuthenticationCommand:
+    def setup_method(self):
+        # Mock Settings so we always use default constants regardless of local config.
+        with patch("shards_ai_agents_cli.authentication.main.Settings") as mock_settings:
+            instance = mock_settings.return_value
+            instance.oauth2_provider = "workos"
+            instance.oauth2_domain = SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_DOMAIN
+            instance.oauth2_client_id = SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_CLIENT_ID
+            instance.oauth2_audience = SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_AUDIENCE
+            instance.oauth2_extra = {}
+            self.auth_command = AuthenticationCommand()
+
+    @pytest.mark.parametrize(
+        "user_provider,expected_urls",
+        [
+            (
+                "workos",
+                {
+                    "device_code_url": f"https://{SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_DOMAIN}/oauth2/device_authorization",
+                    "token_url": f"https://{SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_DOMAIN}/oauth2/token",
+                    "client_id": SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_CLIENT_ID,
+                    "audience": SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_AUDIENCE,
+                    "domain": SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_DOMAIN,
+                },
+            ),
+        ],
+    )
+    @patch("shards_ai_agents_cli.authentication.main.AuthenticationCommand._get_device_code")
+    @patch(
+        "shards_ai_agents_cli.authentication.main.AuthenticationCommand._display_auth_instructions"
+    )
+    @patch("shards_ai_agents_cli.authentication.main.AuthenticationCommand._poll_for_token")
+    @patch("shards_ai_agents_core.auth.oauth2.console.print")
+    def test_login(
+        self,
+        mock_console_print,
+        mock_poll,
+        mock_display,
+        mock_get_device,
+        user_provider,
+        expected_urls,
+    ):
+        mock_get_device.return_value = {
+            "device_code": "test_code",
+            "user_code": "123456",
+        }
+
+        self.auth_command.login()
+
+        mock_console_print.assert_called_once_with(
+            "Signing in to Shards-ai-agents AMP...\n", style="bold blue"
+        )
+        mock_get_device.assert_called_once()
+        mock_display.assert_called_once_with(
+            {"device_code": "test_code", "user_code": "123456"}
+        )
+        mock_poll.assert_called_once_with(
+            {"device_code": "test_code", "user_code": "123456"},
+        )
+        assert (
+            self.auth_command.oauth2_provider.get_client_id()
+            == expected_urls["client_id"]
+        )
+        assert (
+            self.auth_command.oauth2_provider.get_audience()
+            == expected_urls["audience"]
+        )
+        assert (
+            self.auth_command.oauth2_provider._get_domain() == expected_urls["domain"]
+        )
+
+    @patch("shards_ai_agents_core.auth.oauth2.webbrowser")
+    @patch("shards_ai_agents_core.auth.oauth2.console.print")
+    def test_display_auth_instructions(self, mock_console_print, mock_webbrowser):
+        device_code_data = {
+            "verification_uri_complete": "https://example.com/auth",
+            "user_code": "123456",
+        }
+
+        self.auth_command._display_auth_instructions(device_code_data)
+
+        expected_calls = [
+            call("1. Navigate to: ", "https://example.com/auth"),
+            call("2. Enter the following code: ", "123456"),
+        ]
+        mock_console_print.assert_has_calls(expected_calls)
+        mock_webbrowser.open.assert_called_once_with("https://example.com/auth")
+
+    @pytest.mark.parametrize(
+        "user_provider,jwt_config",
+        [
+            (
+                "workos",
+                {
+                    "jwks_url": f"https://{SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_DOMAIN}/oauth2/jwks",
+                    "issuer": f"https://{SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_DOMAIN}",
+                    "audience": SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_AUDIENCE,
+                },
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("has_expiration", [True, False])
+    @patch("shards_ai_agents_core.auth.oauth2.validate_jwt_token")
+    @patch("shards_ai_agents_core.auth.oauth2.TokenManager.save_tokens")
+    def test_validate_and_save_token(
+        self,
+        mock_save_tokens,
+        mock_validate_jwt,
+        user_provider,
+        jwt_config,
+        has_expiration,
+    ):
+        from shards_ai_agents_cli.authentication.main import Oauth2Settings
+        from shards_ai_agents_cli.authentication.providers.workos import WorkosProvider
+
+        if user_provider == "workos":
+            self.auth_command.oauth2_provider = WorkosProvider(
+                settings=Oauth2Settings(
+                    provider=user_provider,
+                    client_id="test-client-id",
+                    domain=SHARDS_AI_AGENTS_ENTERPRISE_DEFAULT_OAUTH2_DOMAIN,
+                    audience=jwt_config["audience"],
+                )
+            )
+
+        token_data = {"access_token": "test_access_token", "id_token": "test_id_token"}
+
+        if has_expiration:
+            future_timestamp = int((datetime.now() + timedelta(days=100)).timestamp())
+            decoded_token = {"exp": future_timestamp}
+        else:
+            decoded_token = {}
+
+        mock_validate_jwt.return_value = decoded_token
+
+        self.auth_command._validate_and_save_token(token_data)
+
+        mock_validate_jwt.assert_called_once_with(
+            jwt_token="test_access_token",
+            jwks_url=jwt_config["jwks_url"],
+            issuer=jwt_config["issuer"],
+            audience=jwt_config["audience"],
+        )
+
+        if has_expiration:
+            mock_save_tokens.assert_called_once_with(
+                "test_access_token", future_timestamp
+            )
+        else:
+            mock_save_tokens.assert_called_once_with("test_access_token", 0)
+
+    @patch("shards_ai_agents_cli.tools.main.ToolCommand")
+    @patch("shards_ai_agents_cli.authentication.main.Settings")
+    @patch("shards_ai_agents_core.auth.oauth2.console.print")
+    def test_login_to_tool_repository_success(
+        self, mock_console_print, mock_settings, mock_tool_command
+    ):
+        mock_tool_instance = MagicMock()
+        mock_tool_command.return_value = mock_tool_instance
+
+        mock_settings_instance = MagicMock()
+        mock_settings_instance.org_name = "Test Org"
+        mock_settings_instance.org_uuid = "test-uuid-123"
+        mock_settings_instance.enterprise_base_url = "https://app.shards-ai-agents.invalid"
+        mock_settings.return_value = mock_settings_instance
+
+        self.auth_command._login_to_tool_repository()
+
+        mock_tool_command.assert_called_once_with(base_url="https://app.shards-ai-agents.invalid")
+        mock_tool_instance.login.assert_called_once()
+
+        expected_calls = [
+            call(
+                "Now logging you in to the Tool Repository... ",
+                style="bold blue",
+                end="",
+            ),
+            call("Success!\n", style="bold green"),
+            call(
+                "You are now authenticated to the tool repository for organization [bold cyan]'Test Org'[/bold cyan]",
+                style="green",
+            ),
+        ]
+        mock_console_print.assert_has_calls(expected_calls)
+
+    @patch("shards_ai_agents_cli.tools.main.ToolCommand")
+    @patch("shards_ai_agents_core.auth.oauth2.console.print")
+    def test_login_to_tool_repository_error(
+        self, mock_console_print, mock_tool_command
+    ):
+        mock_tool_instance = MagicMock()
+        mock_tool_instance.login.side_effect = Exception("Tool repository error")
+        mock_tool_command.return_value = mock_tool_instance
+
+        self.auth_command._login_to_tool_repository()
+
+        mock_tool_command.assert_called_once()
+        mock_tool_instance.login.assert_called_once()
+
+        expected_calls = [
+            call(
+                "Now logging you in to the Tool Repository... ",
+                style="bold blue",
+                end="",
+            ),
+            call(
+                "\n[bold yellow]Warning:[/bold yellow] Authentication with the Tool Repository failed.",
+                style="yellow",
+            ),
+            call(
+                "Other features will work normally, but you may experience limitations with downloading and publishing tools.\nRun [bold]shards-agents login[/bold] to try logging in again.\n",
+                style="yellow",
+            ),
+        ]
+        mock_console_print.assert_has_calls(expected_calls)
+
+    @patch("shards_ai_agents_core.auth.oauth2.httpx.post")
+    def test_get_device_code(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "device_code": "test_device_code",
+            "user_code": "123456",
+            "verification_uri_complete": "https://example.com/auth",
+        }
+        mock_post.return_value = mock_response
+
+        self.auth_command.oauth2_provider = MagicMock()
+        self.auth_command.oauth2_provider.get_client_id.return_value = "test_client"
+        self.auth_command.oauth2_provider.get_authorize_url.return_value = (
+            "https://example.com/device"
+        )
+        self.auth_command.oauth2_provider.get_audience.return_value = "test_audience"
+        self.auth_command.oauth2_provider.get_oauth_scopes.return_value = ["openid", "profile", "email"]
+
+        result = self.auth_command._get_device_code()
+
+        mock_post.assert_called_once_with(
+            url="https://example.com/device",
+            data={
+                "client_id": "test_client",
+                "scope": "openid profile email",
+                "audience": "test_audience",
+            },
+            timeout=20,
+        )
+
+        assert result == {
+            "device_code": "test_device_code",
+            "user_code": "123456",
+            "verification_uri_complete": "https://example.com/auth",
+        }
+
+    @patch("shards_ai_agents_core.auth.oauth2.httpx.post")
+    @patch("shards_ai_agents_core.auth.oauth2.console.print")
+    def test_poll_for_token_success(self, mock_console_print, mock_post):
+        mock_response_success = MagicMock()
+        mock_response_success.status_code = 200
+        mock_response_success.json.return_value = {
+            "access_token": "test_access_token",
+            "id_token": "test_id_token",
+        }
+        mock_post.return_value = mock_response_success
+
+        device_code_data = {"device_code": "test_device_code", "interval": 1}
+
+        with (
+            patch.object(
+                self.auth_command, "_validate_and_save_token"
+            ) as mock_validate,
+            patch.object(
+                self.auth_command, "_login_to_tool_repository"
+            ) as mock_tool_login,
+            patch.object(self.auth_command, "_select_organization") as mock_select_org,
+        ):
+            self.auth_command.oauth2_provider = MagicMock()
+            self.auth_command.oauth2_provider.get_token_url.return_value = (
+                "https://example.com/token"
+            )
+            self.auth_command.oauth2_provider.get_client_id.return_value = "test_client"
+
+            self.auth_command._poll_for_token(device_code_data)
+
+            mock_post.assert_called_once_with(
+                "https://example.com/token",
+                data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "device_code": "test_device_code",
+                    "client_id": "test_client",
+                },
+                timeout=30,
+            )
+
+            mock_validate.assert_called_once()
+            mock_select_org.assert_called_once()
+            mock_tool_login.assert_called_once()
+
+            expected_calls = [
+                call("\nWaiting for authentication... ", style="bold blue", end=""),
+                call("Success!", style="bold green"),
+                call("\n[bold green]Welcome to Shards-ai-agents AMP![/bold green]\n"),
+            ]
+            mock_console_print.assert_has_calls(expected_calls)
+
+    @patch("shards_ai_agents_cli.authentication.main.pick", return_value="org-research")
+    @patch("shards_ai_agents_cli.authentication.main.console")
+    @patch("shards_ai_agents_cli.authentication.main.Settings")
+    @patch("shards_ai_agents_cli.authentication.main.get_auth_token", return_value="token")
+    @patch("shards_ai_agents_cli.authentication.main.PlusAPI")
+    def test_select_organization_saves_the_prompted_choice(
+        self,
+        mock_plus_api,
+        mock_get_auth_token,
+        mock_settings,
+        mock_console,
+        mock_pick,
+    ):
+        response = MagicMock()
+        response.json.return_value = [
+            {"name": "Engineering", "uuid": "org-engineering"},
+            {"name": "Research", "uuid": "org-research"},
+        ]
+        mock_plus_api.return_value.get_organizations.return_value = response
+        mock_settings.return_value.enterprise_base_url = "https://app.shards-ai-agents.invalid"
+
+        self.auth_command._select_organization()
+
+        mock_plus_api.assert_called_once_with(
+            api_key="token", base_url="https://app.shards-ai-agents.invalid"
+        )
+        response.raise_for_status.assert_called_once()
+        mock_pick.assert_called_once_with(
+            "Select an organization (Name / ID):",
+            [("org-engineering", "Engineering"), ("org-research", "Research")],
+            labels=["Engineering  org-engineering", "Research     org-research"],
+        )
+        settings = mock_settings.return_value
+        assert settings.org_name == "Research"
+        assert settings.org_uuid == "org-research"
+        settings.dump.assert_called_once()
+
+    @patch("shards_ai_agents_cli.authentication.main.Settings")
+    @patch("shards_ai_agents_cli.authentication.main.pick", return_value=None)
+    @patch("shards_ai_agents_cli.authentication.main.get_auth_token", return_value="token")
+    @patch("shards_ai_agents_cli.authentication.main.PlusAPI")
+    def test_select_organization_keeps_settings_when_picker_is_cancelled(
+        self, mock_plus_api, mock_get_auth_token, mock_pick, mock_settings
+    ):
+        response = MagicMock()
+        response.json.return_value = [{"name": "Engineering", "uuid": "org-engineering"}]
+        mock_plus_api.return_value.get_organizations.return_value = response
+
+        self.auth_command._select_organization()
+
+        mock_settings.return_value.dump.assert_not_called()
+
+    @patch("shards_ai_agents_cli.authentication.main.pick", return_value="org-unknown")
+    @patch("shards_ai_agents_cli.authentication.main.console")
+    @patch("shards_ai_agents_cli.authentication.main.Settings")
+    @patch("shards_ai_agents_cli.authentication.main.get_auth_token", return_value="token")
+    @patch("shards_ai_agents_cli.authentication.main.PlusAPI")
+    def test_select_organization_displays_a_fallback_for_a_missing_name(
+        self,
+        mock_plus_api,
+        mock_get_auth_token,
+        mock_settings,
+        mock_console,
+        mock_pick,
+    ):
+        response = MagicMock()
+        response.json.return_value = [{"name": None, "uuid": "org-unknown"}]
+        mock_plus_api.return_value.get_organizations.return_value = response
+
+        self.auth_command._select_organization()
+
+        mock_pick.assert_called_once_with(
+            "Select an organization (Name / ID):",
+            [("org-unknown", None)],
+            labels=["Unnamed organization  org-unknown"],
+        )
+        settings = mock_settings.return_value
+        assert settings.org_name is None
+        assert settings.org_uuid == "org-unknown"
+
+    @patch("shards_ai_agents_cli.authentication.main.console")
+    @patch("shards_ai_agents_cli.authentication.main.get_auth_token", return_value="token")
+    @patch("shards_ai_agents_cli.authentication.main.PlusAPI")
+    def test_select_organization_handles_no_available_organizations(
+        self, mock_plus_api, mock_get_auth_token, mock_console
+    ):
+        response = MagicMock()
+        response.json.return_value = []
+        mock_plus_api.return_value.get_organizations.return_value = response
+
+        self.auth_command._select_organization()
+
+        mock_console.print.assert_called_once_with(
+            "You don't belong to any organizations yet.", style="yellow"
+        )
+
+    @patch("shards_ai_agents_core.auth.oauth2.httpx.post")
+    @patch("shards_ai_agents_core.auth.oauth2.console.print")
+    def test_poll_for_token_waits_until_the_code_expires_then_exits(
+        self, mock_console_print, mock_post, fake_clock
+    ):
+        mock_post.return_value = _token_response(400, {"error": "authorization_pending"})
+
+        with pytest.raises(SystemExit) as exc_info:
+            self.auth_command._poll_for_token(
+                {"device_code": "test_device_code", "interval": 5, "expires_in": 300}
+            )
+
+        assert exc_info.value.code == 1
+        assert 300 <= fake_clock.now < 305
+        mock_console_print.assert_any_call(
+            "Timeout: the login code expired before sign-in finished. "
+            "Please try again.",
+            style="bold red",
+        )
+
+    @patch("shards_ai_agents_core.auth.oauth2.httpx.post")
+    @patch("shards_ai_agents_core.auth.oauth2.console.print")
+    def test_poll_for_token_falls_back_to_ten_minutes_without_expires_in(
+        self, mock_console_print, mock_post, fake_clock
+    ):
+        mock_post.return_value = _token_response(400, {"error": "authorization_pending"})
+
+        with pytest.raises(SystemExit) as exc_info:
+            self.auth_command._poll_for_token(
+                {"device_code": "test_device_code", "interval": 5}
+            )
+
+        assert exc_info.value.code == 1
+        assert 600 <= fake_clock.now < 605
+
+    @patch("shards_ai_agents_core.auth.oauth2.httpx.post")
+    @patch("shards_ai_agents_core.auth.oauth2.console.print")
+    def test_poll_for_token_treats_the_providers_expired_token_as_the_timeout(
+        self, mock_console_print, mock_post, fake_clock
+    ):
+        """The provider can expire the code before our own deadline passes."""
+        mock_post.side_effect = [
+            _token_response(400, {"error": "authorization_pending"}),
+            _token_response(400, {"error": "expired_token"}),
+        ]
+
+        with pytest.raises(SystemExit) as exc_info:
+            self.auth_command._poll_for_token(
+                {"device_code": "test_device_code", "interval": 5, "expires_in": 300}
+            )
+
+        assert exc_info.value.code == 1
+        assert fake_clock.now == 5
+        mock_console_print.assert_any_call(
+            "Timeout: the login code expired before sign-in finished. "
+            "Please try again.",
+            style="bold red",
+        )
+
+    @patch("shards_ai_agents_core.auth.oauth2.httpx.post")
+    @patch("shards_ai_agents_core.auth.oauth2.console.print")
+    def test_poll_for_token_signs_in_after_more_than_ten_pending_polls(
+        self, mock_console_print, mock_post, fake_clock
+    ):
+        """A sign-in that takes about a minute used to be cut off at 10 polls."""
+        mock_post.side_effect = [
+            *(
+                _token_response(400, {"error": "authorization_pending"})
+                for _ in range(12)
+            ),
+            _token_response(200, {"access_token": "test_access_token"}),
+        ]
+
+        with (
+            patch.object(self.auth_command, "_validate_and_save_token") as mock_save,
+            patch.object(self.auth_command, "_post_login"),
+        ):
+            self.auth_command._poll_for_token(
+                {"device_code": "test_device_code", "interval": 5, "expires_in": 900}
+            )
+
+        mock_save.assert_called_once_with({"access_token": "test_access_token"})
+        mock_console_print.assert_any_call("Success!", style="bold green")
+
+    @patch("shards_ai_agents_core.auth.oauth2.httpx.post")
+    def test_poll_for_token_error(self, mock_post):
+        """Test the method to poll for token (error path)."""
+        mock_response_error = MagicMock()
+        mock_response_error.status_code = 400
+        mock_response_error.json.return_value = {
+            "error": "access_denied",
+            "error_description": "User denied access",
+        }
+        mock_post.return_value = mock_response_error
+
+        device_code_data = {"device_code": "test_device_code", "interval": 1}
+
+        with pytest.raises(httpx.HTTPError):
+            self.auth_command._poll_for_token(device_code_data)

@@ -1,0 +1,1656 @@
+"""Tests for shards_ai_agents_cli.run_crew JSON crew handling."""
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import click
+import pytest
+from shards_ai_agents_core.constants import SHARDS_AI_AGENTS_TRAINED_AGENTS_FILE_ENV
+
+import shards_ai_agents_cli.input_prompt as input_prompt_module
+import shards_ai_agents_cli.run_crew as run_crew_module
+from shards_ai_agents_cli.version import get_shards_ai_agents_tools_dependency
+
+
+def test_missing_shards_ai_agents_package_shows_full_install_hint(monkeypatch):
+    def missing_shards_ai_agents_package():
+        raise ModuleNotFoundError("No module named 'shards_ai_agents'", name="shards_ai_agents")
+
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "shards_ai_agents.project.crew_loader":
+            missing_shards_ai_agents_package()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    with pytest.raises(click.ClickException) as exc_info:
+        run_crew_module._load_json_crew(Path("crew.jsonc"))
+
+    message = exc_info.value.message
+    assert "Shards-ai-agents CLI is installed without the `shards_ai_agents` package" in message
+    assert f"uv tool install --force '{get_shards_ai_agents_tools_dependency()}'" in message
+    assert "quotes are required in zsh" in message
+
+
+def test_run_crew_forwards_trained_agents_file_to_json_crews(monkeypatch):
+    """shards-agents run -f must reach JSON crews, not only classic subprocess crews."""
+    monkeypatch.setattr(run_crew_module, "read_toml", lambda: {})
+    monkeypatch.setattr(
+        run_crew_module,
+        "configured_project_json_crew",
+        lambda pyproject_data=None, project_root=None: Path("crew.jsonc"),
+    )
+    called: dict = {}
+
+    def fake_run_json_crew_in_project_env(
+        trained_agents_file=None, crew_path=None, inputs=None
+    ):
+        called["trained_agents_file"] = trained_agents_file
+        called["crew_path"] = crew_path
+        called["inputs"] = inputs
+
+    monkeypatch.setattr(
+        run_crew_module,
+        "_run_json_crew_in_project_env",
+        fake_run_json_crew_in_project_env,
+    )
+
+    run_crew_module.run_crew(trained_agents_file="some.pkl")
+
+    assert called == {
+        "trained_agents_file": "some.pkl",
+        "crew_path": Path("crew.jsonc"),
+        "inputs": None,
+    }
+
+
+def test_json_run_uses_project_env_when_pyproject_exists(monkeypatch, tmp_path: Path):
+    """JSON crew runs should execute inside the project uv environment."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    install_calls = []
+    subprocess_calls = []
+
+    monkeypatch.setattr(
+        run_crew_module,
+        "_install_json_crew_dependencies_if_needed",
+        lambda: install_calls.append(True),
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "build_env_with_all_tool_credentials",
+        lambda: {"EXISTING": "value"},
+    )
+
+    def fake_subprocess_run(command, **kwargs):
+        subprocess_calls.append((command, kwargs))
+
+    monkeypatch.setattr(run_crew_module.subprocess, "run", fake_subprocess_run)
+
+    crew_path = tmp_path / "crew.jsonc"
+    run_crew_module._run_json_crew_in_project_env(
+        trained_agents_file="trained.pkl",
+        crew_path=crew_path,
+    )
+
+    expected_env = {
+        "EXISTING": "value",
+        run_crew_module._SHARDS_AI_AGENTS_CLI_RUNNER_PACKAGE_DIR_ENV: str(
+            Path(run_crew_module.__file__).resolve().parent
+        ),
+        SHARDS_AI_AGENTS_TRAINED_AGENTS_FILE_ENV: "trained.pkl",
+        run_crew_module._SHARDS_AI_AGENTS_JSON_CREW_DEFINITION_ENV: str(crew_path),
+    }
+    if local_shards_ai_agents_source_dir := run_crew_module._find_local_shards_ai_agents_source_dir():
+        expected_env[run_crew_module._SHARDS_AI_AGENTS_RUNNER_SOURCE_DIR_ENV] = str(
+            local_shards_ai_agents_source_dir
+        )
+
+    assert install_calls == [True]
+    assert subprocess_calls == [
+        (
+            [
+                "uv",
+                "run",
+                "--no-sync",
+                "python",
+                "-c",
+                run_crew_module._JSON_CREW_RUNNER_CODE,
+            ],
+            {
+                "capture_output": False,
+                "text": True,
+                "check": True,
+                "env": expected_env,
+            },
+        )
+    ]
+
+
+def test_json_run_uses_poetry_run_for_poetry_lock_without_uv_lock(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    (tmp_path / "poetry.lock").write_text("# lock\n")
+    monkeypatch.setattr(
+        run_crew_module,
+        "_install_json_crew_dependencies_if_needed",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "build_env_with_all_tool_credentials",
+        lambda: {},
+    )
+    subprocess_calls = []
+
+    def fake_subprocess_run(command, **kwargs):
+        subprocess_calls.append((command, kwargs))
+
+    monkeypatch.setattr(run_crew_module.subprocess, "run", fake_subprocess_run)
+
+    run_crew_module._run_json_crew_in_project_env()
+
+    expected_env = {
+        run_crew_module._SHARDS_AI_AGENTS_CLI_RUNNER_PACKAGE_DIR_ENV: str(
+            Path(run_crew_module.__file__).resolve().parent
+        ),
+    }
+    if local_shards_ai_agents_source_dir := run_crew_module._find_local_shards_ai_agents_source_dir():
+        expected_env[run_crew_module._SHARDS_AI_AGENTS_RUNNER_SOURCE_DIR_ENV] = str(
+            local_shards_ai_agents_source_dir
+        )
+
+    assert subprocess_calls == [
+        (
+            [
+                "poetry",
+                "run",
+                "python",
+                "-c",
+                run_crew_module._JSON_CREW_RUNNER_CODE,
+            ],
+            {
+                "capture_output": False,
+                "text": True,
+                "check": True,
+                "env": expected_env,
+            },
+        )
+    ]
+
+
+def test_json_runner_code_loads_current_cli_package_over_project_env(tmp_path: Path):
+    old_parent = tmp_path / "old"
+    old_pkg = old_parent / "shards_ai_agents_cli"
+    old_pkg.mkdir(parents=True)
+    (old_pkg / "__init__.py").write_text("")
+    (old_pkg / "run_crew.py").write_text("raise ImportError('old package used')\n")
+    old_shards_ai_agents_project = old_parent / "shards_ai_agents" / "project"
+    old_shards_ai_agents_project.mkdir(parents=True)
+    (old_parent / "shards_ai_agents" / "__init__.py").write_text("")
+    (old_shards_ai_agents_project / "__init__.py").write_text("")
+    (old_shards_ai_agents_project / "json_loader.py").write_text(
+        "raise ImportError('old shards_ai_agents used')\n"
+    )
+
+    current_pkg = tmp_path / "current" / "shards_ai_agents_cli"
+    current_pkg.mkdir(parents=True)
+    marker = tmp_path / "marker.txt"
+    (current_pkg / "__init__.py").write_text("")
+    (current_pkg / "run_crew.py").write_text(
+        "from pathlib import Path\n"
+        "from shards_ai_agents.project.json_loader import SOURCE\n"
+        "def _run_json_crew(trained_agents_file=None):\n"
+        f"    Path({str(marker)!r}).write_text(SOURCE + ':' + (trained_agents_file or ''))\n"
+    )
+    current_shards_ai_agents_project = tmp_path / "current_shards_ai_agents_src" / "shards_ai_agents" / "project"
+    current_shards_ai_agents_project.mkdir(parents=True)
+    (tmp_path / "current_shards_ai_agents_src" / "shards_ai_agents" / "__init__.py").write_text("")
+    (current_shards_ai_agents_project / "__init__.py").write_text("")
+    (current_shards_ai_agents_project / "json_loader.py").write_text("SOURCE = 'current'\n")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(old_parent)
+    env[run_crew_module._SHARDS_AI_AGENTS_CLI_RUNNER_PACKAGE_DIR_ENV] = str(current_pkg)
+    env[run_crew_module._SHARDS_AI_AGENTS_RUNNER_SOURCE_DIR_ENV] = str(
+        tmp_path / "current_shards_ai_agents_src"
+    )
+    env[SHARDS_AI_AGENTS_TRAINED_AGENTS_FILE_ENV] = "trained.pkl"
+
+    subprocess.run(
+        [sys.executable, "-c", run_crew_module._JSON_CREW_RUNNER_CODE],
+        check=True,
+        env=env,
+        cwd=tmp_path,
+    )
+
+    assert marker.read_text() == "current:trained.pkl"
+
+
+def test_json_runner_pins_the_machines_proxy_before_the_project_env_loads(
+    tmp_path: Path,
+):
+    """The runner is a fresh interpreter that never imports cli.py. It reads the
+    machine's proxy and CA for AMP before `_run_json_crew` loads the project's
+    .env, so that file cannot choose where the saved login travels."""
+    from shards_ai_agents_core import plus_api
+
+    current_pkg = tmp_path / "cli" / "shards_ai_agents_cli"
+    current_pkg.mkdir(parents=True)
+    pinned = tmp_path / "pinned.json"
+    (current_pkg / "__init__.py").write_text("")
+    (current_pkg / "run_crew.py").write_text(
+        "import json\n"
+        "from pathlib import Path\n"
+        "from dotenv import load_dotenv\n"
+        "def _run_json_crew(trained_agents_file=None):\n"
+        "    load_dotenv(Path.cwd() / '.env', override=True)\n"
+        "    from shards_ai_agents_core import plus_api\n"
+        f"    Path({str(pinned)!r}).write_text(json.dumps(plus_api._MACHINE_TRANSPORT_ENV))\n"
+    )
+    (tmp_path / ".env").write_text(
+        "HTTPS_PROXY=http://project-proxy.test:8080\nSSL_CERT_FILE=/project/ca.pem\n"
+    )
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not plus_api._sets_transport(key)
+    }
+    env["HTTPS_PROXY"] = "http://machine-proxy.test:3128"
+    env[run_crew_module._SHARDS_AI_AGENTS_CLI_RUNNER_PACKAGE_DIR_ENV] = str(current_pkg)
+
+    subprocess.run(
+        [sys.executable, "-c", run_crew_module._JSON_CREW_RUNNER_CODE],
+        check=True,
+        env=env,
+        cwd=tmp_path,
+    )
+
+    assert json.loads(pinned.read_text()) == {
+        "HTTPS_PROXY": "http://machine-proxy.test:3128"
+    }
+
+
+def test_json_runner_ignores_shards_ai_agents_modules_planted_in_the_project(tmp_path: Path):
+    """The runner starts in the project folder; a shards_ai_agents_core package there must
+    not be the module that pins where the saved login travels, while the
+    project's own modules stay importable for its code."""
+    planted = tmp_path / "shards_ai_agents_core"
+    planted.mkdir()
+    (planted / "__init__.py").write_text("")
+    (planted / "plus_api.py").write_text(
+        "_MACHINE_TRANSPORT_ENV = {'HTTPS_PROXY': 'http://attacker.test:8080'}\n"
+    )
+    current_pkg = tmp_path / "cli" / "shards_ai_agents_cli"
+    current_pkg.mkdir(parents=True)
+    pinned = tmp_path / "pinned.json"
+    (current_pkg / "__init__.py").write_text("")
+    (tmp_path / "project_helpers.py").write_text("VALUE = 'project code still imports'\n")
+    (current_pkg / "run_crew.py").write_text(
+        "import json\n"
+        "from pathlib import Path\n"
+        "def _run_json_crew(trained_agents_file=None):\n"
+        "    from shards_ai_agents_core import plus_api\n"
+        "    import project_helpers\n"
+        f"    Path({str(pinned)!r}).write_text(json.dumps("
+        "{'file': plus_api.__file__, 'env': plus_api._MACHINE_TRANSPORT_ENV, "
+        "'project': project_helpers.VALUE}))\n"
+    )
+    from shards_ai_agents_core import plus_api
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not plus_api._sets_transport(key)
+    }
+    env[run_crew_module._SHARDS_AI_AGENTS_CLI_RUNNER_PACKAGE_DIR_ENV] = str(current_pkg)
+
+    subprocess.run(
+        [sys.executable, "-c", run_crew_module._JSON_CREW_RUNNER_CODE],
+        check=True,
+        env=env,
+        cwd=tmp_path,
+    )
+
+    loaded = json.loads(pinned.read_text())
+    assert loaded["file"] == plus_api.__file__
+    assert loaded["env"] == {}
+    assert loaded["project"] == "project code still imports"
+
+
+def test_json_runner_stops_when_plus_api_fails_to_import(tmp_path: Path):
+    """Only a shards-ai-agents-core without plus_api is skipped; a plus_api that fails to
+    import stops the runner with its own error instead of running unpinned."""
+    broken = tmp_path / "broken_env" / "shards_ai_agents_core"
+    broken.mkdir(parents=True)
+    (broken / "__init__.py").write_text("")
+    (broken / "plus_api.py").write_text("raise ImportError('plus_api needs httpx 0.28')\n")
+    current_pkg = tmp_path / "cli" / "shards_ai_agents_cli"
+    current_pkg.mkdir(parents=True)
+    (current_pkg / "__init__.py").write_text("")
+    (current_pkg / "run_crew.py").write_text("def _run_json_crew(trained_agents_file=None):\n    pass\n")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(broken.parent)
+    env[run_crew_module._SHARDS_AI_AGENTS_CLI_RUNNER_PACKAGE_DIR_ENV] = str(current_pkg)
+
+    result = subprocess.run(
+        [sys.executable, "-c", run_crew_module._JSON_CREW_RUNNER_CODE],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "ImportError: plus_api needs httpx 0.28" in result.stderr
+
+
+def test_json_runner_imports_with_older_project_env_shards_ai_agents_core(tmp_path: Path):
+    old_parent = tmp_path / "old_env"
+    old_shards_ai_agents_core = old_parent / "shards_ai_agents_core"
+    old_shards_ai_agents_core.mkdir(parents=True)
+    (old_shards_ai_agents_core / "__init__.py").write_text("")
+    (old_shards_ai_agents_core / "constants.py").write_text(
+        "SHARDS_AI_AGENTS_TRAINED_AGENTS_FILE_ENV = 'SHARDS_AI_AGENTS_TRAINED_AGENTS_FILE'\n"
+    )
+    (old_shards_ai_agents_core / "project.py").write_text(
+        "def read_toml(*args, **kwargs):\n"
+        "    return {}\n"
+        "def parse_toml(*args, **kwargs):\n"
+        "    return {}\n"
+        "def get_project_description(*args, **kwargs):\n"
+        "    return None\n"
+        "def get_project_name(*args, **kwargs):\n"
+        "    return None\n"
+        "def get_project_version(*args, **kwargs):\n"
+        "    return None\n"
+    )
+    (old_shards_ai_agents_core / "tool_credentials.py").write_text(
+        "def build_env_with_all_tool_credentials(*args, **kwargs):\n"
+        "    return {}\n"
+        "def build_env_with_tool_repository_credentials(*args, **kwargs):\n"
+        "    return {}\n"
+    )
+    (old_shards_ai_agents_core / "version.py").write_text(
+        "def check_version(*args, **kwargs):\n"
+        "    return None\n"
+        "def get_shards_ai_agents_version(*args, **kwargs):\n"
+        "    return '1.0.0'\n"
+        "def get_latest_version_from_pypi(*args, **kwargs):\n"
+        "    return None\n"
+        "def is_current_version_yanked(*args, **kwargs):\n"
+        "    return False\n"
+        "def is_newer_version_available(*args, **kwargs):\n"
+        "    return False\n"
+    )
+
+    marker = tmp_path / "marker.txt"
+    old_shards_ai_agents_project = old_parent / "shards_ai_agents" / "project"
+    old_shards_ai_agents_project.mkdir(parents=True)
+    (old_parent / "shards_ai_agents" / "__init__.py").write_text("")
+    (old_shards_ai_agents_project / "__init__.py").write_text("")
+    (old_shards_ai_agents_project / "crew_loader.py").write_text(
+        "from pathlib import Path\n"
+        "class Crew:\n"
+        "    agents = []\n"
+        "    tasks = []\n"
+        "    def kickoff(self, inputs):\n"
+        f"        Path({str(marker)!r}).write_text('ran')\n"
+        "        return 'done'\n"
+        "def load_crew(path):\n"
+        "    return Crew(), {}\n"
+    )
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(old_parent)
+    env["SHARDS_AI_AGENTS_DMN"] = "true"
+    env[run_crew_module._SHARDS_AI_AGENTS_CLI_RUNNER_PACKAGE_DIR_ENV] = str(
+        Path(run_crew_module.__file__).resolve().parent
+    )
+    env[run_crew_module._SHARDS_AI_AGENTS_JSON_CREW_DEFINITION_ENV] = "crew.jsonc"
+
+    subprocess.run(
+        [sys.executable, "-c", run_crew_module._JSON_CREW_RUNNER_CODE],
+        check=True,
+        env=env,
+        cwd=tmp_path,
+    )
+
+    assert marker.read_text() == "ran"
+
+
+def test_json_run_without_pyproject_runs_in_process(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    called: dict = {}
+
+    def fake_run_json_crew(trained_agents_file=None, crew_path=None, inputs=None):
+        called["trained_agents_file"] = trained_agents_file
+        called["crew_path"] = crew_path
+        called["inputs"] = inputs
+        return "result"
+
+    monkeypatch.setattr(run_crew_module, "_run_json_crew", fake_run_json_crew)
+
+    assert (
+        run_crew_module._run_json_crew_in_project_env(
+            trained_agents_file="trained.pkl"
+        )
+        == "result"
+    )
+    assert called == {
+        "trained_agents_file": "trained.pkl",
+        "crew_path": None,
+        "inputs": None,
+    }
+
+
+def test_json_project_env_run_failure_exits_nonzero(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+
+    monkeypatch.setattr(
+        run_crew_module, "_install_json_crew_dependencies_if_needed", lambda: None
+    )
+    monkeypatch.setattr(
+        run_crew_module, "build_env_with_all_tool_credentials", lambda: {}
+    )
+
+    def fake_subprocess_run(command, **kwargs):
+        raise subprocess.CalledProcessError(7, command)
+
+    monkeypatch.setattr(run_crew_module.subprocess, "run", fake_subprocess_run)
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_crew_module._run_json_crew_in_project_env()
+
+    assert exc_info.value.code == 7
+
+
+def test_json_run_installs_dependencies_when_pyproject_has_no_lockfile(
+    monkeypatch, tmp_path: Path
+):
+    """JSON crew runs should lock/sync project dependencies only when needed."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    calls = []
+
+    def fake_install_crew(
+        proxy_options, *, raise_on_error=False, install_project=None
+    ):
+        calls.append((proxy_options, raise_on_error, install_project))
+
+    monkeypatch.setattr("shards_ai_agents_cli.install_crew.install_crew", fake_install_crew)
+
+    run_crew_module._install_json_crew_dependencies_if_needed()
+
+    assert calls == [([], True, None)]
+
+
+def test_json_run_syncs_frozen_when_uv_lock_exists_without_venv(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    (tmp_path / "uv.lock").write_text("# lock\n")
+    calls = []
+
+    def fake_install_crew(
+        proxy_options, *, raise_on_error=False, install_project=None
+    ):
+        calls.append((proxy_options, raise_on_error, install_project))
+
+    monkeypatch.setattr("shards_ai_agents_cli.install_crew.install_crew", fake_install_crew)
+
+    run_crew_module._install_json_crew_dependencies_if_needed()
+
+    assert calls == [(["--frozen"], True, None)]
+
+
+def test_json_run_skips_uv_sync_when_only_poetry_lock_exists_without_venv(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    (tmp_path / "poetry.lock").write_text("# lock\n")
+    calls = []
+
+    def fake_install_crew(
+        proxy_options, *, raise_on_error=False, install_project=None
+    ):
+        calls.append((proxy_options, raise_on_error, install_project))
+
+    monkeypatch.setattr("shards_ai_agents_cli.install_crew.install_crew", fake_install_crew)
+
+    run_crew_module._install_json_crew_dependencies_if_needed()
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("lockfile", ["uv.lock", "poetry.lock"])
+def test_json_run_skips_dependency_install_when_lockfile_and_venv_exist(
+    monkeypatch, tmp_path: Path, lockfile: str
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    (tmp_path / lockfile).write_text("# lock\n")
+    (tmp_path / ".venv").mkdir()
+    calls = []
+
+    def fake_install_crew(
+        proxy_options, *, raise_on_error=False, install_project=None
+    ):
+        calls.append((proxy_options, raise_on_error, install_project))
+
+    monkeypatch.setattr("shards_ai_agents_cli.install_crew.install_crew", fake_install_crew)
+
+    run_crew_module._install_json_crew_dependencies_if_needed()
+
+    assert calls == []
+
+
+def test_json_run_skips_dependency_install_without_pyproject(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    calls = []
+
+    def fake_install_crew(
+        proxy_options, *, raise_on_error=False, install_project=None
+    ):
+        calls.append((proxy_options, raise_on_error))
+
+    monkeypatch.setattr("shards_ai_agents_cli.install_crew.install_crew", fake_install_crew)
+
+    run_crew_module._install_json_crew_dependencies_if_needed()
+
+    assert calls == []
+
+
+def test_json_run_install_failure_exits_nonzero(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+
+    def fake_install_crew(
+        proxy_options, *, raise_on_error=False, install_project=None
+    ):
+        raise subprocess.CalledProcessError(42, ["uv", "sync"])
+
+    monkeypatch.setattr("shards_ai_agents_cli.install_crew.install_crew", fake_install_crew)
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_crew_module._install_json_crew_dependencies_if_needed()
+
+    assert exc_info.value.code == 42
+
+
+def test_run_json_crew_exports_trained_agents_env(monkeypatch, tmp_path: Path):
+    """JSON crews run in-process, so the pickle path must land in the env var."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(SHARDS_AI_AGENTS_TRAINED_AGENTS_FILE_ENV, raising=False)
+
+    try:
+        # No crew.json(c) in tmp_path: the loader fails *after* the env var
+        # export, which is the part under test.
+        with pytest.raises(FileNotFoundError):
+            run_crew_module._run_json_crew(trained_agents_file="some.pkl")
+        assert os.environ[SHARDS_AI_AGENTS_TRAINED_AGENTS_FILE_ENV] == "some.pkl"
+    finally:
+        os.environ.pop(SHARDS_AI_AGENTS_TRAINED_AGENTS_FILE_ENV, None)
+
+
+def test_run_json_crew_leaves_env_untouched_without_flag(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(SHARDS_AI_AGENTS_TRAINED_AGENTS_FILE_ENV, raising=False)
+
+    with pytest.raises(FileNotFoundError):
+        run_crew_module._run_json_crew()
+
+    assert SHARDS_AI_AGENTS_TRAINED_AGENTS_FILE_ENV not in os.environ
+
+
+def test_missing_input_names_accepts_hyphenated_placeholders():
+    """The prompt regex must accept the same names kickoff interpolation does."""
+    from types import SimpleNamespace
+
+    crew = SimpleNamespace(
+        agents=[
+            SimpleNamespace(
+                role="Researcher", goal="Cover {my-topic}", backstory=""
+            )
+        ],
+        tasks=[
+            SimpleNamespace(
+                description="Write about {my-topic} for {target-audience}",
+                expected_output="Post",
+                output_file=None,
+            )
+        ],
+    )
+
+    assert run_crew_module._missing_input_names(crew, {}) == [
+        "my-topic",
+        "target-audience",
+    ]
+
+
+def _patch_tui_run(monkeypatch, status: str, want_traced_rerun: bool = False):
+    """Stub the TUI pieces of _run_json_crew so only exit handling runs."""
+    monkeypatch.delenv("SHARDS_AI_AGENTS_DMN", raising=False)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)  # the TUI needs a terminal
+
+    class FakeApp:
+        def __init__(self, **kwargs):
+            self._status = status
+            self._crew_result = "result" if status == "completed" else None
+            self._want_deploy = False
+            self._want_traced_rerun = want_traced_rerun
+
+        def run(self):
+            pass
+
+    from types import SimpleNamespace
+
+    crew = SimpleNamespace(name="Demo", tasks=[], agents=[])
+    monkeypatch.setattr(
+        run_crew_module, "configured_project_json_crew", lambda: Path("crew.jsonc")
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_load_json_crew_for_tui",
+        lambda _path: (FakeApp, crew, {}, [], []),
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_resolve_crew_inputs",
+        lambda _crew, default_inputs, _provided, *, interactive: default_inputs,
+    )
+    monkeypatch.setattr(run_crew_module, "_print_post_tui_summary", lambda _app: None)
+
+
+def test_run_json_crew_failed_status_exits_nonzero(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    _patch_tui_run(monkeypatch, status="failed")
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_crew_module._run_json_crew()
+
+    assert exc_info.value.code == 1
+
+
+def test_run_json_crew_completed_status_returns_result(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    _patch_tui_run(monkeypatch, status="completed")
+
+    assert run_crew_module._run_json_crew() == "result"
+
+
+def test_evaluate_on_an_untraced_run_runs_the_crew_again_for_its_evaluation(
+    monkeypatch, tmp_path: Path
+):
+    """The app closed because its run was not traced: what follows is
+    `shards-agents eval`'s own path, told to run the crew again whatever the record."""
+    monkeypatch.chdir(tmp_path)
+    # what the project's `.env` put in this process, as the run app's process has it
+    monkeypatch.setenv("SHARDS_AI_AGENTS_PLUS_URL", "https://other.example")
+    _patch_tui_run(monkeypatch, status="completed", want_traced_rerun=True)
+    evaluated: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.experimental.eval_crew.eval_crew",
+        lambda **kwargs: evaluated.append(kwargs),
+    )
+
+    assert run_crew_module._run_json_crew() == "result"
+    from shards_ai_agents_cli.experimental.eval_crew import _machine_amp_origins
+
+    # the same crew, with the inputs this run used (none here), and the saved
+    # login trusted only to this machine's AMPs, never the `.env`'s
+    assert evaluated == [
+        {
+            "run_again": True,
+            "run_args": {"inputs": "{}"},
+            "trusted_amp_origins": _machine_amp_origins(),
+        }
+    ]
+    assert "https://other.example" not in evaluated[0]["trusted_amp_origins"]
+
+
+def test_run_json_crew_dmn_mode_bypasses_tui(monkeypatch, tmp_path: Path, capsys):
+    from types import SimpleNamespace
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SHARDS_AI_AGENTS_DMN", "True")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    crew_path = tmp_path / "crew.jsonc"
+    crew_path.write_text("{}")
+    kickoff_calls = []
+
+    class FakeCrew:
+        name = "Demo"
+        agents = [SimpleNamespace(role="Researcher", goal="Research", backstory="")]
+        tasks = [
+            SimpleNamespace(
+                description="Research",
+                expected_output="Findings",
+                output_file=None,
+            )
+        ]
+
+        def kickoff(self, inputs):
+            kickoff_calls.append(inputs)
+            return "plain result"
+
+    monkeypatch.setattr(
+        run_crew_module, "configured_project_json_crew", lambda: crew_path
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_load_json_crew",
+        lambda _path: (FakeCrew(), {"topic": "AI"}),
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_load_json_crew_for_tui",
+        lambda _path: pytest.fail("DMN mode must not start the TUI loader"),
+    )
+
+    assert run_crew_module._run_json_crew() == "plain result"
+
+    captured = capsys.readouterr()
+    assert kickoff_calls == [{"topic": "AI"}]
+    assert "plain result" in captured.out
+
+
+def _headless_crew(monkeypatch, tmp_path: Path, kickoff_calls: list[dict]) -> None:
+    """A JSON crew whose kickoff records its inputs and returns a plain result."""
+    from types import SimpleNamespace
+
+    crew_path = tmp_path / "crew.jsonc"
+    crew_path.write_text("{}")
+
+    class FakeCrew:
+        name = "Demo"
+        agents = [SimpleNamespace(role="Researcher", goal="Research", backstory="")]
+        tasks: list = []
+
+        def kickoff(self, inputs):
+            kickoff_calls.append(inputs)
+            return "plain result"
+
+    monkeypatch.setattr(
+        run_crew_module, "configured_project_json_crew", lambda: crew_path
+    )
+    monkeypatch.setattr(
+        run_crew_module, "_load_json_crew", lambda _path: (FakeCrew(), {"topic": "AI"})
+    )
+
+
+def test_run_json_crew_without_a_terminal_runs_headless_and_exits(
+    monkeypatch, tmp_path: Path, capsys
+):
+    """A coding agent's shell has no terminal: the TUI would stay open after the
+    crew finished and `shards-agents run` would never exit."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SHARDS_AI_AGENTS_DMN", raising=False)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    kickoff_calls: list[dict] = []
+    _headless_crew(monkeypatch, tmp_path, kickoff_calls)
+    monkeypatch.setattr(
+        run_crew_module,
+        "_load_json_crew_for_tui",
+        lambda _path: pytest.fail("without a terminal the TUI must not start"),
+    )
+
+    assert run_crew_module._run_json_crew() == "plain result"
+
+    assert kickoff_calls == [{"topic": "AI"}]
+    assert "plain result" in capsys.readouterr().out
+
+
+def test_run_json_crew_in_a_terminal_opens_the_tui(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SHARDS_AI_AGENTS_DMN", raising=False)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    opened: list[str] = []
+
+    class FakeApp:
+        def __init__(self, **kwargs):
+            self._status = "completed"
+            self._crew_result = "tui result"
+            self._want_deploy = False
+            opened.append(kwargs["crew_name"])
+
+        def run(self):
+            pass
+
+    crew = SimpleNamespace(name="Demo", tasks=[], agents=[])
+    monkeypatch.setattr(
+        run_crew_module, "configured_project_json_crew", lambda: Path("crew.jsonc")
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_load_json_crew_for_tui",
+        lambda _path: (FakeApp, crew, {}, [], []),
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_load_json_crew",
+        lambda _path: pytest.fail("a terminal gets the TUI, not the plain run"),
+    )
+    monkeypatch.setattr(run_crew_module, "_print_post_tui_summary", lambda _app: None)
+
+    assert run_crew_module._run_json_crew() == "tui result"
+    assert opened == ["Demo"]
+
+
+def test_run_json_crew_dmn_mode_exits_on_missing_inputs(
+    monkeypatch, tmp_path: Path, capsys
+):
+    from types import SimpleNamespace
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SHARDS_AI_AGENTS_DMN", "True")
+    crew_path = tmp_path / "crew.jsonc"
+    crew_path.write_text("{}")
+    crew = SimpleNamespace(
+        agents=[
+            SimpleNamespace(
+                role="Researcher",
+                goal="Research {topic}",
+                backstory="",
+            )
+        ],
+        tasks=[],
+    )
+
+    monkeypatch.setattr(
+        run_crew_module, "configured_project_json_crew", lambda: crew_path
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_load_json_crew",
+        lambda _path: (crew, {}),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_crew_module._run_json_crew()
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 1
+    assert "Missing required input 'topic'" in captured.err
+
+
+# ── Declarative-crew inputs: merge --inputs, warn, prompt (flow parity) ──
+
+
+def _crew_with_placeholders(*names: str) -> object:
+    """A minimal crew whose agent goal references each ``{name}`` placeholder."""
+    from types import SimpleNamespace
+
+    goal = " ".join(f"{{{name}}}" for name in names)
+    return SimpleNamespace(
+        agents=[SimpleNamespace(role="Researcher", goal=goal, backstory="")],
+        tasks=[],
+    )
+
+
+def test_resolve_crew_inputs_merges_inputs_over_defaults():
+    crew = _crew_with_placeholders("topic")
+
+    resolved = run_crew_module._resolve_crew_inputs(
+        crew, {"topic": "AI"}, {"topic": "ML"}, interactive=False
+    )
+
+    assert resolved == {"topic": "ML"}
+
+
+def test_resolve_crew_inputs_warns_and_keeps_unknown_input(capsys):
+    # The placeholder scan is heuristic, so an unreferenced key is flagged but
+    # kept (never silently dropped like a flow's schema would).
+    crew = _crew_with_placeholders("topic")
+
+    resolved = run_crew_module._resolve_crew_inputs(
+        crew, {}, {"topic": "AI", "topi": "typo"}, interactive=False
+    )
+
+    captured = capsys.readouterr()
+    assert resolved == {"topic": "AI", "topi": "typo"}
+    assert "isn't referenced by any {placeholder}" in captured.err
+    assert "Did you mean 'topic'?" in captured.err
+
+
+def test_resolve_crew_inputs_prompts_when_interactive(monkeypatch):
+    crew = _crew_with_placeholders("topic")
+    prompted: list[str] = []
+
+    def fake_prompt(text: str, **kwargs: object) -> str:
+        prompted.append(text)
+        return "AI"
+
+    monkeypatch.setattr(input_prompt_module.click, "prompt", fake_prompt)
+
+    resolved = run_crew_module._resolve_crew_inputs(
+        crew, {}, None, interactive=True
+    )
+
+    assert resolved == {"topic": "AI"}
+    assert any("topic" in text for text in prompted)
+
+
+def test_resolve_crew_inputs_errors_when_missing_non_interactive(capsys):
+    crew = _crew_with_placeholders("topic")
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_crew_module._resolve_crew_inputs(crew, {}, None, interactive=False)
+
+    assert exc_info.value.code == 1
+    assert "Missing required input 'topic'" in capsys.readouterr().err
+
+
+def test_run_json_crew_accepts_inputs_argument(monkeypatch, tmp_path: Path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SHARDS_AI_AGENTS_DMN", "True")
+    crew_path = tmp_path / "crew.jsonc"
+    crew_path.write_text("{}")
+    kickoff_calls: list[dict] = []
+
+    class FakeCrew:
+        name = "Demo"
+        agents = [_crew_with_placeholders("topic").agents[0]]
+        tasks: list = []
+
+        def kickoff(self, inputs):
+            kickoff_calls.append(inputs)
+            return "ok"
+
+    monkeypatch.setattr(
+        run_crew_module, "configured_project_json_crew", lambda: crew_path
+    )
+    monkeypatch.setattr(
+        run_crew_module, "_load_json_crew", lambda _path: (FakeCrew(), {})
+    )
+
+    assert run_crew_module._run_json_crew(inputs='{"topic":"AI"}') == "ok"
+    assert kickoff_calls == [{"topic": "AI"}]
+
+
+def test_run_json_crew_in_project_env_forwards_inputs(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    monkeypatch.setattr(
+        run_crew_module, "_install_json_crew_dependencies_if_needed", lambda: None
+    )
+    monkeypatch.setattr(
+        run_crew_module, "build_env_with_all_tool_credentials", lambda: {}
+    )
+    captured_kwargs: list[dict] = []
+    monkeypatch.setattr(
+        run_crew_module.subprocess,
+        "run",
+        lambda command, **kwargs: captured_kwargs.append(kwargs),
+    )
+
+    run_crew_module._run_json_crew_in_project_env(
+        crew_path=tmp_path / "crew.jsonc", inputs='{"topic":"AI"}'
+    )
+
+    env = captured_kwargs[0]["env"]
+    assert env[run_crew_module._SHARDS_AI_AGENTS_JSON_CREW_INPUTS_ENV] == '{"topic":"AI"}'
+
+
+def test_run_json_crew_in_project_env_rejects_invalid_inputs_json(
+    monkeypatch, tmp_path: Path, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    monkeypatch.setattr(
+        run_crew_module.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("subprocess must not run on invalid --inputs"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_crew_module._run_json_crew_in_project_env(
+            crew_path=tmp_path / "crew.jsonc", inputs="not json"
+        )
+
+    assert exc_info.value.code == 1
+    assert "Invalid --inputs JSON" in capsys.readouterr().err
+
+
+def test_run_crew_forwards_inputs_to_json_crew(monkeypatch):
+    monkeypatch.setattr(run_crew_module, "read_toml", lambda *a, **k: {})
+    monkeypatch.setattr(
+        run_crew_module,
+        "configured_project_json_crew",
+        lambda *a, **k: Path("crew.jsonc"),
+    )
+    called: dict = {}
+    monkeypatch.setattr(
+        run_crew_module,
+        "_run_json_crew_in_project_env",
+        lambda **kw: called.update(kw),
+    )
+
+    run_crew_module.run_crew(inputs='{"topic":"AI"}')
+
+    assert called == {
+        "trained_agents_file": None,
+        "crew_path": Path("crew.jsonc"),
+        "inputs": '{"topic":"AI"}',
+    }
+
+
+def test_configured_project_json_crew_defers_to_declared_flow_type(
+    monkeypatch, tmp_path: Path
+):
+    """A flow project containing a stray crew.jsonc must still run as a flow."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "crew.jsonc").write_text("{}")
+    (tmp_path / "pyproject.toml").write_text('[tool.shards_ai_agents]\ntype = "flow"\n')
+
+    assert run_crew_module.configured_project_json_crew() is None
+
+
+def test_configured_project_json_crew_returns_declared_crew_definition(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    crew_path = tmp_path / "crew.jsonc"
+    crew_path.write_text("{}")
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.shards_ai_agents]\ntype = "crew"\ndefinition = "crew.jsonc"\n'
+    )
+
+    assert run_crew_module.configured_project_json_crew() == crew_path.resolve()
+
+
+def test_configured_project_json_crew_ignores_declared_crew_without_definition(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "crew.jsonc").write_text("{}")
+    (tmp_path / "pyproject.toml").write_text('[tool.shards_ai_agents]\ntype = "crew"\n')
+
+    assert run_crew_module.configured_project_json_crew() is None
+
+
+def test_configured_project_json_crew_ignores_missing_pyproject(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "crew.jsonc").write_text("{}")
+
+    assert run_crew_module.configured_project_json_crew() is None
+
+
+def test_run_crew_inputs_rejected_for_classic_crew(monkeypatch):
+    # --inputs works for declarative flows and declarative (JSON) crews, but a
+    # classic crew takes its inputs from main.py, so it errors clearly.
+    monkeypatch.setattr(run_crew_module, "read_toml", lambda *a, **k: {})
+    monkeypatch.setattr(
+        run_crew_module, "configured_project_json_crew", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        run_crew_module, "_warn_if_old_poetry_project", lambda *a, **k: None
+    )
+    monkeypatch.setattr(run_crew_module, "get_shards_ai_agents_project_type", lambda *a, **k: "crew")
+
+    with pytest.raises(click.UsageError) as exc_info:
+        run_crew_module.run_crew(inputs='{"topic":"AI"}')
+
+    assert (
+        "--inputs is only supported for declarative flows and crews"
+        in exc_info.value.message
+    )
+
+
+def test_run_crew_inputs_without_definition_resolves_configured_flow(monkeypatch):
+    # --inputs with no --definition resolves the configured [tool.shards_ai_agents] flow,
+    # exactly like a bare `shards-agents run`, and forwards the inputs.
+    import shards_ai_agents_cli.run_declarative_flow as rdf
+
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(run_crew_module, "read_toml", lambda *a, **k: {})
+    monkeypatch.setattr(
+        run_crew_module, "configured_project_json_crew", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        run_crew_module, "_warn_if_old_poetry_project", lambda *a, **k: None
+    )
+    monkeypatch.setattr(run_crew_module, "get_shards_ai_agents_project_type", lambda *a, **k: "flow")
+    monkeypatch.setattr(
+        rdf, "configured_project_declarative_flow", lambda *a, **k: Path("flow.yaml")
+    )
+    monkeypatch.setattr(
+        rdf, "run_declarative_flow_in_project_env", lambda **kw: calls.update(kw)
+    )
+
+    run_crew_module.run_crew(inputs='{"topic":"AI"}')
+
+    assert calls == {"definition": Path("flow.yaml"), "inputs": '{"topic":"AI"}'}
+
+
+def test_run_crew_rejects_filename_with_explicit_definition():
+    with pytest.raises(click.UsageError) as exc_info:
+        run_crew_module.run_crew(
+            trained_agents_file="trained.pkl",
+            definition="flow.yaml",
+        )
+
+    assert "--filename can only be used when running crews" in exc_info.value.message
+
+
+def test_run_crew_runs_explicit_declarative_definition(monkeypatch, capsys):
+    calls = []
+
+    def fake_run_declarative_flow(definition: str, inputs: str | None = None):
+        calls.append((definition, inputs))
+
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.run_declarative_flow.run_declarative_flow",
+        fake_run_declarative_flow,
+    )
+
+    run_crew_module.run_crew(definition="flow.yaml", inputs='{"topic":"AI"}')
+
+    captured = capsys.readouterr()
+    assert "experimental" not in captured.out.lower()
+    assert calls == [("flow.yaml", '{"topic":"AI"}')]
+
+
+def test_run_crew_runs_classic_crew_project(monkeypatch, capsys):
+    calls = []
+
+    monkeypatch.setattr(
+        run_crew_module,
+        "read_toml",
+        lambda: {"tool": {"shards_ai_agents": {"type": "crew"}}},
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_execute_uv_script",
+        lambda script_name, **kwargs: calls.append((script_name, kwargs)),
+    )
+
+    run_crew_module.run_crew(trained_agents_file="trained.pkl")
+
+    assert capsys.readouterr().out == ""
+    assert calls == [
+        (
+            "run_crew",
+            {"entity_type": "crew", "trained_agents_file": "trained.pkl"},
+        )
+    ]
+
+
+def test_run_crew_runs_python_flow_project(monkeypatch, capsys):
+    calls = []
+
+    monkeypatch.setattr(
+        run_crew_module,
+        "read_toml",
+        lambda: {"tool": {"shards_ai_agents": {"type": "flow"}}},
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_execute_uv_script",
+        lambda script_name, **kwargs: calls.append((script_name, kwargs)),
+    )
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.kickoff_flow._load_conversational_flow_from_kickoff_script",
+        lambda: None,
+    )
+
+    run_crew_module.run_crew()
+
+    assert capsys.readouterr().out == ""
+    assert calls == [("kickoff", {"entity_type": "flow"})]
+
+
+@pytest.fixture
+def python_flow_project(tmp_path, monkeypatch):
+    """Write a Python flow project whose `kickoff` script lives in `main.py`,
+    and run from it inside its env (as `uv run shards-agents run` would)."""
+    package = f"inputs_probe_{tmp_path.name.replace('-', '_')}"
+
+    def write(main_py: str, *, kickoff_script: bool = True) -> Path:
+        scripts = f'[project.scripts]\nkickoff = "{package}.main:kickoff"\n'
+        (tmp_path / "pyproject.toml").write_text(
+            f'[project]\nname = "{package}"\n'
+            + (scripts if kickoff_script else "")
+            + '[tool.shards_ai_agents]\ntype = "flow"\n'
+        )
+        source = tmp_path / "src" / package
+        source.mkdir(parents=True)
+        (source / "__init__.py").write_text("")
+        (source / "main.py").write_text(main_py)
+        return tmp_path
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UV_RUN_RECURSION_DEPTH", "1")
+    monkeypatch.setenv("SHARDS_AI_AGENTS_TRACING_ENABLED", "false")
+    yield write
+    for name in [m for m in sys.modules if m.split(".")[0] == package]:
+        del sys.modules[name]
+
+
+_TWO_FLOWS = """
+from shards_ai_agents.flow import Flow, start
+
+class FirstFlow(Flow):
+    @start()
+    def go(self):
+        return "first"
+
+class SecondFlow(Flow):
+    @start()
+    def go(self):
+        return "second"
+
+def kickoff():
+    FirstFlow().kickoff()
+"""
+
+_CONVERSATIONAL_FLOW = """
+from shards_ai_agents.flow import Flow
+
+class ChatFlow(Flow):
+    conversational = True
+
+def kickoff():
+    ChatFlow().kickoff()
+"""
+
+
+def test_run_crew_reruns_python_flow_inputs_inside_the_project_env(
+    tmp_path, monkeypatch
+):
+    """Outside the project env, `--inputs` re-runs `shards-agents run` there, as a
+    declarative flow does, so the flow imports with the project's dependencies."""
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\n')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("UV_RUN_RECURSION_DEPTH", raising=False)
+    monkeypatch.setattr(
+        run_crew_module, "read_toml", lambda: {"tool": {"shards_ai_agents": {"type": "flow"}}}
+    )
+    commands = []
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.run_declarative_flow.subprocess.run",
+        lambda command, **kwargs: commands.append(command),
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_execute_uv_script",
+        lambda *a, **k: pytest.fail("ran the kickoff script instead of the flow"),
+    )
+
+    run_crew_module.run_crew(inputs='{"topic": "Quantum"}')
+
+    assert commands == [
+        ["uv", "run", "shards-agents", "run", "--inputs", '{"topic": "Quantum"}']
+    ]
+
+
+@pytest.mark.parametrize(
+    ("inputs", "message"),
+    [
+        ("{bad", "Invalid --inputs JSON: Expecting property name"),
+        ("[1]", "Invalid --inputs JSON: expected an object."),
+    ],
+)
+def test_run_crew_rejects_bad_python_flow_inputs_before_running(
+    monkeypatch, capsys, inputs, message
+):
+    monkeypatch.setattr(
+        run_crew_module, "read_toml", lambda: {"tool": {"shards_ai_agents": {"type": "flow"}}}
+    )
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.run_declarative_flow.subprocess.run",
+        lambda *a, **k: pytest.fail("started the project env for invalid inputs"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_crew_module.run_crew(inputs=inputs)
+
+    assert exc_info.value.code == 1
+    assert message in capsys.readouterr().err
+
+
+def test_run_crew_inputs_name_every_flow_when_main_defines_two(python_flow_project):
+    python_flow_project(_TWO_FLOWS)
+
+    with pytest.raises(
+        click.UsageError,
+        match=r"exactly one Flow class defined in inputs_probe_\w+\.main; "
+        r"found: FirstFlow, SecondFlow",
+    ):
+        run_crew_module.run_crew(inputs='{"topic": "Quantum"}')
+
+
+def test_run_crew_inputs_kick_off_a_flow_bound_under_two_names(
+    python_flow_project, tmp_path
+):
+    """An alias such as `MyFlow = ContentFlow` is still one Flow class."""
+    python_flow_project(
+        """
+from pathlib import Path
+
+from shards_ai_agents.flow import Flow, start
+
+class ContentFlow(Flow):
+    @start()
+    def go(self):
+        Path("topic.txt").write_text(self.state["topic"])
+
+MyFlow = ContentFlow
+
+def kickoff():
+    ContentFlow().kickoff()
+"""
+    )
+
+    run_crew_module.run_crew(inputs='{"topic": "Quantum"}')
+
+    assert (tmp_path / "topic.txt").read_text() == "Quantum"
+
+
+def test_run_crew_inputs_refuse_a_conversational_flow(python_flow_project):
+    python_flow_project(_CONVERSATIONAL_FLOW)
+
+    with pytest.raises(
+        click.UsageError, match="not supported for a conversational flow"
+    ):
+        run_crew_module.run_crew(inputs='{"topic": "Quantum"}')
+
+
+def test_run_crew_inputs_need_a_kickoff_script(python_flow_project):
+    python_flow_project(_TWO_FLOWS, kickoff_script=False)
+
+    with pytest.raises(
+        click.UsageError, match=r"needs a `kickoff` script in \[project\.scripts\]"
+    ):
+        run_crew_module.run_crew(inputs='{"topic": "Quantum"}')
+
+
+def test_run_crew_runs_conversational_flow_tui(monkeypatch, capsys):
+    class Flow:
+        pass
+
+    flow = Flow()
+    calls = []
+
+    monkeypatch.delenv("SHARDS_AI_AGENTS_DMN", raising=False)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(
+        run_crew_module,
+        "read_toml",
+        lambda: {"tool": {"shards_ai_agents": {"type": "flow"}}},
+    )
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.kickoff_flow._load_conversational_flow_from_kickoff_script",
+        lambda: flow,
+    )
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.kickoff_flow._run_conversational_flow_tui",
+        lambda loaded_flow: calls.append(loaded_flow),
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_execute_uv_script",
+        lambda *_args, **_kwargs: pytest.fail(
+            "conversational flows must use the TUI"
+        ),
+    )
+
+    run_crew_module.run_crew()
+
+    assert capsys.readouterr().out == ""
+    assert calls == [flow]
+
+
+def _patch_conversational_flow_project(monkeypatch) -> list[str]:
+    """A flow project whose kickoff script yields a conversational flow.
+
+    Returns the list that records whether the chat TUI or the kickoff
+    subprocess was reached; a headless run must reach neither.
+    """
+    reached: list[str] = []
+    monkeypatch.setattr(
+        run_crew_module,
+        "read_toml",
+        lambda: {"tool": {"shards_ai_agents": {"type": "flow"}}},
+    )
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.kickoff_flow._load_conversational_flow_from_kickoff_script",
+        object,
+    )
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.kickoff_flow._run_conversational_flow_tui",
+        lambda _flow: reached.append("tui"),
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_execute_uv_script",
+        lambda *_args, **_kwargs: reached.append("uv"),
+    )
+    return reached
+
+
+def test_run_crew_conversational_flow_without_terminal_exits_with_guidance(
+    monkeypatch, capsys
+):
+    """No stdin TTY (a coding agent, CI): the chat TUI would wait forever."""
+    reached = _patch_conversational_flow_project(monkeypatch)
+    monkeypatch.delenv("SHARDS_AI_AGENTS_DMN", raising=False)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_crew_module.run_crew()
+
+    assert exc_info.value.code == 1
+    assert reached == []
+    err = capsys.readouterr().err
+    assert "This flow is conversational, which needs an interactive terminal." in err
+    assert "flow.handle_turn(message, session_id=...)" in err
+    assert "flow.stream_turn(...)" in err
+
+
+def test_run_crew_conversational_flow_in_dmn_mode_exits_with_guidance(
+    monkeypatch, capsys
+):
+    """SHARDS_AI_AGENTS_DMN counts as headless even when stdin is a terminal."""
+    reached = _patch_conversational_flow_project(monkeypatch)
+    monkeypatch.setenv("SHARDS_AI_AGENTS_DMN", "true")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_crew_module.run_crew()
+
+    assert exc_info.value.code == 1
+    assert reached == []
+    assert "needs an interactive terminal" in capsys.readouterr().err
+
+
+def test_run_crew_non_conversational_flow_without_terminal_still_runs_kickoff(
+    monkeypatch, capsys
+):
+    """The gate is for the chat TUI only; a plain Python flow stays headless-safe."""
+    calls = []
+    monkeypatch.delenv("SHARDS_AI_AGENTS_DMN", raising=False)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(
+        run_crew_module,
+        "read_toml",
+        lambda: {"tool": {"shards_ai_agents": {"type": "flow"}}},
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_execute_uv_script",
+        lambda script_name, **kwargs: calls.append((script_name, kwargs)),
+    )
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.kickoff_flow._load_conversational_flow_from_kickoff_script",
+        lambda: None,
+    )
+
+    run_crew_module.run_crew()
+
+    assert calls == [("kickoff", {"entity_type": "flow"})]
+    assert "interactive terminal" not in capsys.readouterr().err
+
+
+_CONVERSATIONAL_FLOW_MODULE = "headless_chat_flow_project"
+
+
+@pytest.fixture
+def conversational_flow_project(tmp_path, monkeypatch):
+    """A real project on disk whose kickoff module defines a conversational flow."""
+    package_dir = tmp_path / "src" / _CONVERSATIONAL_FLOW_MODULE
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text("")
+    (package_dir / "main.py").write_text(
+        "from shards_ai_agents.flow import Flow\n\n"
+        "class HeadlessChatFlow(Flow):\n"
+        "    conversational = True\n\n"
+        "def kickoff():\n"
+        "    HeadlessChatFlow().chat()\n"
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\n"
+        'name = "headless-chat"\n'
+        "[project.scripts]\n"
+        f'kickoff = "{_CONVERSATIONAL_FLOW_MODULE}.main:kickoff"\n'
+        "[tool.shards_ai_agents]\n"
+        'type = "flow"\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    # The loader imports the project in-process and prepends src/ to sys.path.
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    yield tmp_path
+    for name in (f"{_CONVERSATIONAL_FLOW_MODULE}.main", _CONVERSATIONAL_FLOW_MODULE):
+        sys.modules.pop(name, None)
+
+
+@pytest.mark.parametrize(
+    "args", [["run"], ["flow", "kickoff"]], ids=["run", "flow-kickoff-alias"]
+)
+def test_cli_conversational_python_flow_without_terminal_does_not_hang(
+    conversational_flow_project, monkeypatch, args
+):
+    """End to end through the CLI: CliRunner's stdin is not a TTY, like an agent's."""
+    from click.testing import CliRunner
+
+    from shards_ai_agents_cli.cli import shards_ai_agents
+
+    reached: list[str] = []
+    monkeypatch.delenv("SHARDS_AI_AGENTS_DMN", raising=False)
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.kickoff_flow._run_conversational_flow_tui",
+        lambda _flow: reached.append("tui"),
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_execute_uv_script",
+        lambda *_args, **_kwargs: reached.append("uv"),
+    )
+
+    result = CliRunner().invoke(shards_ai_agents, args)
+
+    assert reached == []
+    assert isinstance(result.exception, SystemExit)
+    assert result.exit_code == 1
+    assert "needs an interactive terminal" in result.output
+    assert "flow.handle_turn(message, session_id=...)" in result.output
+
+
+def test_run_crew_rejects_filename_for_flow_project(monkeypatch):
+    monkeypatch.setattr(
+        run_crew_module,
+        "read_toml",
+        lambda: {"tool": {"shards_ai_agents": {"type": "flow"}}},
+    )
+
+    with pytest.raises(click.UsageError) as exc_info:
+        run_crew_module.run_crew(trained_agents_file="trained.pkl")
+
+    assert "--filename can only be used when running crews" in exc_info.value.message
+
+
+def test_run_crew_runs_configured_declarative_flow_project(
+    monkeypatch, tmp_path: Path, capsys
+):
+    calls = []
+
+    monkeypatch.chdir(tmp_path)
+    definition_path = tmp_path / "flow.yaml"
+    definition_path.write_text("schema: shards_ai_agents.flow/v1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        run_crew_module,
+        "read_toml",
+        lambda: {
+            "tool": {
+                "shards_ai_agents": {
+                    "type": "flow",
+                    "definition": "flow.yaml",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.run_declarative_flow.run_declarative_flow_in_project_env",
+        lambda definition, inputs=None: calls.append((definition, inputs)),
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_execute_uv_script",
+        lambda *_args, **_kwargs: pytest.fail("declarative flows must not run kickoff"),
+    )
+
+    run_crew_module.run_crew()
+
+    assert capsys.readouterr().out == ""
+    assert calls == [(definition_path.resolve(), None)]
+
+
+
+@pytest.mark.parametrize("token_before", ["a" * 32, None])
+def test_a_projects_env_never_sets_or_replaces_shards_ai_agents_evals_token(
+    monkeypatch, tmp_path: Path, token_before
+):
+    """A `.env` that set SHARDS_AI_AGENTS_EVAL_AWAITING_RUN could unmark a run `shards-agents
+    eval` started (and its tracing would stop applying the command's rules)."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("SHARDS_AI_AGENTS_EVAL_AWAITING_RUN=" + "f" * 32 + "\nFROM_THE_PROJECT=yes\n")
+    if token_before is None:
+        monkeypatch.delenv("SHARDS_AI_AGENTS_EVAL_AWAITING_RUN", raising=False)
+    else:
+        monkeypatch.setenv("SHARDS_AI_AGENTS_EVAL_AWAITING_RUN", token_before)
+    monkeypatch.delenv("FROM_THE_PROJECT", raising=False)
+
+    run_crew_module.load_project_env(env_file)
+
+    assert os.environ.get("SHARDS_AI_AGENTS_EVAL_AWAITING_RUN") == token_before
+    assert os.environ["FROM_THE_PROJECT"] == "yes"
+
+
+def test_the_three_names_for_the_eval_token_are_one() -> None:
+    from shards_ai_agents_core import eval_handshake
+
+    from shards_ai_agents_cli import crew_run_tui
+
+    assert (
+        run_crew_module.EVAL_TOKEN_ENV
+        == crew_run_tui._AWAITING_EVAL_ENV
+        == eval_handshake.AWAITING_ENV
+    )

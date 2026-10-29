@@ -1,0 +1,15 @@
+schema: shards_ai_agents.flow/v1
+name: {{flow_name}}
+description: A declarative Shards-ai-agents Flow.
+
+state:
+  type: dict
+  default:
+    topic: AI agents
+
+methods:
+  start:
+    start: true
+    do:
+      call: expression
+      expr: state.topic

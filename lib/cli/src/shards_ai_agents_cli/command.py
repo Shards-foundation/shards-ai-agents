@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+import json
+
+import httpx
+from rich.console import Console
+from shards_ai_agents_core.telemetry import Telemetry
+
+from shards_ai_agents_cli.authentication.token import get_auth_token
+from shards_ai_agents_cli.plus_api import PlusAPI
+
+
+console = Console()
+
+
+class AuthenticationRequiredError(SystemExit):
+    """Raised when a Plus API command needs the user to log in first."""
+
+
+class BaseCommand:
+    def __init__(self) -> None:
+        self._telemetry = Telemetry()
+        self._telemetry.set_tracer()
+
+
+class PlusAPIMixin:
+    def __init__(self, telemetry: Telemetry, *, base_url: str | None = None) -> None:
+        try:
+            telemetry.set_tracer()
+            self.plus_api_client = PlusAPI(api_key=get_auth_token(), base_url=base_url)
+        except Exception:
+            telemetry.deploy_signup_error_span()
+            console.print(
+                "Please sign up/login to Shards-ai-agents+ before using the CLI.",
+                style="bold red",
+            )
+            console.print(
+                "Run 'shards-agents login' to sign up/login.", style="bold green"
+            )
+            raise AuthenticationRequiredError(1) from None
+
+    def _validate_response(self, response: httpx.Response) -> None:
+        """Handle and display error messages from API responses.
+
+        Args:
+            response: The response from the Plus API.
+
+        Raises:
+            AuthenticationRequiredError: AMP answered 401 (exit code 1).
+            SystemExit: For any other non-2xx response or a body that is not JSON.
+        """
+        if response.status_code == 401:
+            # AMP also answers 401 for a valid token whose account it does not
+            # accept (no AMP user, not activated), which a new login cannot fix:
+            # its own message is the only thing that tells the cases apart.
+            try:
+                body = response.json()
+            except ValueError:
+                # A proxy or gateway in front of AMP can answer 401 with HTML or nothing.
+                body = None
+            reason = (
+                isinstance(body, dict) and (body.get("message") or body.get("error"))
+            ) or response.content.decode("utf-8", errors="replace").strip()
+            console.print(
+                "Shards-ai-agents AMP did not accept your login:", style="bold red"
+            )
+            if reason:
+                console.print(str(reason), markup=False)
+            console.print(
+                "Run 'shards-agents login' to sign in again.", style="bold green"
+            )
+            raise AuthenticationRequiredError(1)
+
+        try:
+            json_response = response.json()
+        except (json.JSONDecodeError, ValueError):
+            console.print(
+                "Failed to parse response from Enterprise API failed. Details:",
+                style="bold red",
+            )
+            console.print(f"Status Code: {response.status_code}")
+            console.print(
+                f"Response:\n{response.content.decode('utf-8', errors='replace')}"
+            )
+            raise SystemExit from None
+
+        if response.status_code == 422:
+            console.print(
+                "Failed to complete operation. Please fix the following errors:",
+                style="bold red",
+            )
+            for field, messages in json_response.items():
+                for message in messages:
+                    console.print(
+                        f"* [bold red]{field.capitalize()}[/bold red] {message}"
+                    )
+            raise SystemExit
+
+        if not response.is_success:
+            console.print(
+                "Request to Enterprise API failed. Details:", style="bold red"
+            )
+            details = (
+                json_response.get("error")
+                or json_response.get("message")
+                or response.content.decode("utf-8", errors="replace")
+            )
+            console.print(f"{details}")
+            raise SystemExit

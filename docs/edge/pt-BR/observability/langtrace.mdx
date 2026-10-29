@@ -1,0 +1,73 @@
+---
+title: Integração com Langtrace
+description: Como monitorar custo, latência e desempenho dos Agentes Shards-ai-agents usando o Langtrace, uma ferramenta externa de observabilidade.
+icon: chart-line
+mode: "wide"
+---
+
+# Visão Geral do Langtrace
+
+O Langtrace é uma ferramenta externa e open-source que auxilia na configuração de observabilidade e avaliações para Modelos de Linguagem de Grande Porte (LLMs), frameworks de LLM e Bancos de Dados Vetoriais.
+Apesar de não ser integrado diretamente ao Shards-ai-agents, o Langtrace pode ser utilizado em conjunto com o Shards-ai-agents para fornecer uma visibilidade aprofundada sobre o custo, latência e desempenho dos seus Agentes Shards-ai-agents.
+Essa integração permite o registro de hiperparâmetros, o monitoramento de regressões de desempenho e o estabelecimento de um processo de melhoria contínua dos seus Agentes.
+
+![Visão geral de uma seleção de execuções de sessões de agentes](/images/langtrace1.png)
+![Visão geral dos traces de agentes](/images/langtrace2.png)
+![Visão detalhada dos traces de LLM](/images/langtrace3.png)
+
+## Instruções de Configuração
+
+<Steps>
+   <Step title="Crie uma conta no Langtrace">
+      Cadastre-se acessando [https://app.langtrace.ai/signup](https://app.langtrace.ai/signup).
+   </Step>
+   <Step title="Crie um projeto">
+      Defina o tipo do projeto como `Shards-ai-agents` e gere uma chave de API.
+   </Step>
+   <Step title="Instale o Langtrace no seu projeto Shards-ai-agents">
+      Use o seguinte comando:
+
+    ```bash
+    pip install langtrace-python-sdk
+    ```
+   </Step>
+   <Step title="Importe o Langtrace">
+      Importe e inicialize o Langtrace no início do seu script, antes de quaisquer imports do Shards-ai-agents:
+
+    ```python
+    from langtrace_python_sdk import langtrace
+    langtrace.init(api_key='<SUA_CHAVE_LANGTRACE>')
+
+    # Agora importe os módulos do Shards-ai-agents
+    from shards_ai_agents import Agent, Task, Crew
+    ```
+   </Step>
+</Steps> 
+
+### Funcionalidades e Sua Aplicação no Shards-ai-agents
+
+1. **Rastreamento de Token e Custo do LLM**
+
+   - Monitore o uso de tokens e os custos associados para cada interação dos agentes Shards-ai-agents.
+
+2. **Gráfico de Trace para Etapas de Execução**
+
+   - Visualize o fluxo de execução das suas tarefas Shards-ai-agents, incluindo latência e logs.
+   - Útil para identificar gargalos nos fluxos de trabalho dos seus agentes.
+
+3. **Curadoria de Dataset com Anotação Manual**
+
+   - Crie conjuntos de dados a partir das saídas das suas tarefas Shards-ai-agents para futuros treinamentos ou avaliações.
+
+4. **Versionamento e Gerenciamento de Prompt**
+
+   - Acompanhe as diferentes versões de prompts utilizados em seus agentes Shards-ai-agents.
+   - Útil para testes A/B e otimização de desempenho dos agentes.
+
+5. **Playground de Prompt com Comparações de Modelos**
+
+   - Teste e compare diferentes prompts e modelos para seus agentes Shards-ai-agents antes da implantação.
+
+6. **Testes e Avaliações**
+
+   - Configure testes automatizados para seus agentes e tarefas Shards-ai-agents.

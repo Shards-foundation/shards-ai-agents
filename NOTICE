@@ -1,0 +1,25 @@
+Shards-ai-agents
+Copyright (c) 2026 Shards Inc Ltd
+
+Attribution
+-----------
+Shards-ai-agents is a derivative work of the open-source crewAI project
+(https://github.com/crewAIInc/crewAI), Copyright (c) 2025 crewAI, Inc.,
+which is distributed under the MIT License. The original copyright notice and
+the MIT License text are retained in the LICENSE file, as the license requires.
+
+This fork was created from upstream commit
+699cedcddce69cb5a9997dfe4afae5c1c1c11789 (version 1.15.33) and has been
+rebranded. "crewAI" and the crewAI logos are trademarks/brands of crewAI, Inc.;
+this project is not affiliated with, endorsed by, or sponsored by crewAI, Inc.
+
+Notable differences from upstream
+---------------------------------
+* Packages, modules, CLI and environment variables are renamed
+  (crewai -> shards_ai_agents, CLI `crewai` -> `shards-agents`, CREWAI_* -> SHARDS_AI_AGENTS_*).
+* Upstream-hosted endpoints (telemetry, PyPI version check, crewai.com / app.crewai.com
+  / docs.crewai.com) were removed or pointed at the reserved ".invalid" TLD so that
+  nothing is sent to the upstream service. Telemetry is off unless
+  SHARDS_AI_AGENTS_TELEMETRY_BASE_URL is set; the version check is off unless
+  SHARDS_AI_AGENTS_VERSION_CHECK_URL is set.
+* Versioned documentation snapshots (docs/v*) and upstream release workflows were removed or disabled.

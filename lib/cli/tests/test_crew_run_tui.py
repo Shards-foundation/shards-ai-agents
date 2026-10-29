@@ -1,0 +1,3053 @@
+import contextvars
+from datetime import datetime, timezone
+import json
+import time
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
+
+from shards_ai_agents.events.event_bus import shards_ai_agents_event_bus
+from shards_ai_agents.events.types.crew_events import CrewKickoffStartedEvent
+from shards_ai_agents.events.types.flow_events import (
+    FlowStartedEvent,
+    MethodExecutionFailedEvent,
+    MethodExecutionFinishedEvent,
+    MethodExecutionPausedEvent,
+    MethodExecutionStartedEvent,
+)
+from shards_ai_agents.events.types.memory_events import (
+    MemorySaveCompletedEvent,
+    MemorySaveFailedEvent,
+    MemorySaveStartedEvent,
+)
+from shards_ai_agents.events.types.observation_events import (
+    GoalAchievedEarlyEvent,
+    PlanRefinementEvent,
+    PlanReplanTriggeredEvent,
+    PlanStepCompletedEvent,
+    PlanStepStartedEvent,
+    StepObservationCompletedEvent,
+    StepObservationFailedEvent,
+    StepObservationStartedEvent,
+)
+from shards_ai_agents.events.types.tool_usage_events import (
+    ToolUsageErrorEvent,
+    ToolUsageFinishedEvent,
+    ToolUsageStartedEvent,
+)
+from shards_ai_agents_cli import crew_run_tui, run_crew
+from shards_ai_agents_cli.authentication.token import AuthError
+from shards_ai_agents_cli.command import AuthenticationRequiredError, PlusAPIMixin
+from shards_ai_agents_cli.crew_run_tui import (
+    _LOG_ARGS_TEXT_LIMIT,
+    _LOG_RESULT_TEXT_LIMIT,
+    _LOG_TRUNCATION_SUFFIX,
+    CrewRunApp,
+    _format_json_in_text,
+    _try_parse_structured,
+)
+import httpx
+import pytest
+from rich.text import Text
+from textual.pilot import Pilot
+
+
+@pytest.fixture(autouse=True)
+def _awaiting_files_stay_in_tmp(tmp_path, monkeypatch):
+    """The waiting-evaluation token file belongs to the user's Shards-ai-agents data
+    directory; a test keeps it in its own."""
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.crew_run_tui._awaiting_dir", lambda: tmp_path / "eval-awaiting"
+    )
+
+
+
+def _app_with_plan() -> CrewRunApp:
+    app = CrewRunApp()
+    app._plan = {
+        "plan": "Demo plan",
+        "steps": [
+            {"step_number": 1, "description": "First"},
+            {"step_number": 2, "description": "Second"},
+            {"step_number": 3, "description": "Third"},
+        ],
+    }
+    app._plan_step_status = {1: "pending", 2: "pending", 3: "pending"}
+    return app
+
+
+def _log_entry(name: str) -> dict:
+    now = time.time()
+    return {
+        "tool_name": name,
+        "status": "success",
+        "args": None,
+        "result": f"{name} result",
+        "error": None,
+        "start_time": now,
+        "duration": 1.0,
+        "task_idx": 1,
+    }
+
+
+def _emit_event(event: object) -> None:
+    future = shards_ai_agents_event_bus.emit(None, event)
+    if future:
+        future.result(timeout=5)
+
+
+def test_chain_deploy_skips_validation_after_auth_retry(monkeypatch) -> None:
+    create_calls: list[dict[str, object]] = []
+    login_calls: list[bool] = []
+
+    class FakeDeployCommand:
+        attempts = 0
+
+        def create_crew(self, **kwargs) -> None:
+            create_calls.append(kwargs)
+            FakeDeployCommand.attempts += 1
+            if FakeDeployCommand.attempts == 1:
+                raise AuthenticationRequiredError
+
+    class FakeAuthenticationCommand:
+        def login(self) -> None:
+            login_calls.append(True)
+
+    monkeypatch.setattr("shards_ai_agents_cli.deploy.main.DeployCommand", FakeDeployCommand)
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.authentication.main.AuthenticationCommand",
+        FakeAuthenticationCommand,
+    )
+
+    run_crew._chain_deploy()
+
+    assert create_calls == [
+        {"confirm": True, "skip_validate": True, "source": "tui"},
+        {"confirm": True, "skip_validate": True, "source": "tui"},
+    ]
+    assert login_calls == [True]
+
+
+def test_chain_deploy_does_not_login_for_deploy_exit(monkeypatch, capsys) -> None:
+    create_calls: list[dict[str, object]] = []
+    login_calls: list[bool] = []
+
+    class FakeDeployCommand:
+        def create_crew(self, **kwargs) -> None:
+            create_calls.append(kwargs)
+            raise SystemExit(42)
+
+    class FakeAuthenticationCommand:
+        def login(self) -> None:
+            login_calls.append(True)
+
+    monkeypatch.setattr("shards_ai_agents_cli.deploy.main.DeployCommand", FakeDeployCommand)
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.authentication.main.AuthenticationCommand",
+        FakeAuthenticationCommand,
+    )
+
+    run_crew._chain_deploy()
+
+    assert create_calls == [{"confirm": True, "skip_validate": True, "source": "tui"}]
+    assert login_calls == []
+    assert "Deploy failed with exit code 42" in capsys.readouterr().out
+
+
+def test_view_traces_opens_the_link_shards_ai_agents_recorded_for_this_run(monkeypatch) -> None:
+    """Shards-ai-agents prints that link after a run but never under a TUI, so the button
+    reads it off the record Shards-ai-agents wrote — matched to THIS app's execution."""
+    app = CrewRunApp()
+    app._status = "completed"
+    app._telemetry = Mock()
+    app._execution_uuid = "run-this-app"
+    monkeypatch.setattr(
+        crew_run_tui,
+        "_recorded_run",
+        lambda uuid: {"execution_id": uuid, "trace_url": "https://amp.example/t/1"}
+        if uuid == "run-this-app"
+        else None,
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(CrewRunApp, "_open_report", lambda self, url: opened.append(url))
+    monkeypatch.setattr(app, "notify", Mock())
+
+    app.on_button_pressed(SimpleNamespace(button=SimpleNamespace(id="btn-traces")))
+
+    app._telemetry.feature_usage_span.assert_called_once_with("cli_usage:view_traces")
+    assert opened == ["https://amp.example/t/1"]
+
+
+@pytest.mark.parametrize(
+    ("record", "said"),
+    [
+        (None, "not traced"),
+        ({"execution_id": "run-this-app"}, "granted no link"),
+    ],
+)
+def test_view_traces_says_which_of_the_two_reasons_there_is_no_link(
+    monkeypatch, record, said
+) -> None:
+    """A run nobody traced and a traced run AMP gave no link for are different
+    problems, and only one of them is the reader's to fix."""
+    app = CrewRunApp()
+    app._status = "completed"
+    app._telemetry = Mock()
+    app._execution_uuid = "run-this-app"
+    monkeypatch.setattr(crew_run_tui, "_recorded_run", lambda uuid: record)
+    monkeypatch.setattr(
+        CrewRunApp, "_open_report", lambda self, url: pytest.fail("nothing to open")
+    )
+    notices: list[str] = []
+    monkeypatch.setattr(app, "notify", lambda message, **kwargs: notices.append(message))
+
+    app.on_button_pressed(SimpleNamespace(button=SimpleNamespace(id="btn-traces")))
+
+    assert said in notices[0]
+
+
+def test_deploy_button_click_records_telemetry() -> None:
+    app = CrewRunApp()
+    app._status = "completed"
+    app._crew_result = object()
+    app._telemetry = Mock()
+    app._unsubscribe = lambda: None  # type: ignore[method-assign]
+    exits: list[object] = []
+    app.exit = lambda result: exits.append(result)  # type: ignore[method-assign]
+
+    app.on_button_pressed(SimpleNamespace(button=SimpleNamespace(id="btn-deploy")))
+
+    app._telemetry.feature_usage_span.assert_called_once_with("cli_usage:deploy")
+    assert app._want_deploy is True
+    assert exits == [app._crew_result]
+
+
+def test_evaluate_button_evaluates_here_and_does_not_leave(monkeypatch) -> None:
+    """The evaluation takes minutes, has a link worth showing and a verdict
+    worth reading. Sending somebody to a bare terminal to wait for them is the
+    worst of both, so it runs on this screen — and it names THIS app's
+    execution, not whichever run finished last in the project."""
+    app = CrewRunApp()
+    app._status = "completed"
+    app._telemetry = Mock()
+    app._execution_uuid = "run-this-app"
+    app.exit = lambda result=None: pytest.fail("the app must stay open")  # type: ignore[method-assign]
+    started: list[str] = []
+    monkeypatch.setattr(
+        CrewRunApp, "_evaluate_worker", lambda self, execution_id: started.append(execution_id)
+    )
+    monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: uuid == "run-this-app")
+
+    app.on_button_pressed(SimpleNamespace(button=SimpleNamespace(id="btn-eval")))
+
+    app._telemetry.feature_usage_span.assert_called_once_with("cli_usage:evaluate")
+    assert started == ["run-this-app"]
+    assert app._evaluation == {"state": "starting", "execution_id": "run-this-app"}
+
+
+def test_the_button_spins_while_it_evaluates_and_still_opens_the_report(
+    monkeypatch,
+) -> None:
+    """A label that never moves reads as a screen that has stopped — and the
+    report page is where the progress is, so the button stays pressable."""
+    app = CrewRunApp()
+    app._status = "completed"
+    app._telemetry = Mock()
+    app._execution_uuid = "run-this-app"
+    monkeypatch.setattr(CrewRunApp, "_evaluate_worker", lambda self, execution_id: None)
+    monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: True)
+    labels: list[str] = []
+    button = SimpleNamespace(label="Evaluate", disabled=False)
+    monkeypatch.setattr(CrewRunApp, "query_one", lambda self, *a: button)
+    monkeypatch.setattr(CrewRunApp, "_open_report", lambda self, url: None)
+
+    app.action_evaluate_crew()
+    labels.append(str(button.label))
+    app._frame += 1
+    app._refresh_eval_button()
+    labels.append(str(button.label))
+
+    assert all(label.endswith("Evaluating…") for label in labels)
+    assert labels[0] != labels[1]  # it moves
+    assert button.disabled is False  # and it is not a dead button
+
+    app._evaluation_started({"id": "ev-1", "url": "https://optimize.example/e/1"})
+    app._evaluation_finished({"status": "done", "verdict": {"gate": "passed"}})
+    assert str(button.label) == "Open eval report"
+
+
+def test_pressing_evaluate_again_opens_the_report_it_already_made(monkeypatch) -> None:
+    """One evaluation per run: the second press is somebody looking for the
+    report, not asking to pay for another."""
+    app = CrewRunApp()
+    app._status = "completed"
+    app._telemetry = Mock()
+    app._evaluation = {"state": "done", "url": "https://optimize.example/e/1"}
+    monkeypatch.setattr(
+        CrewRunApp, "_evaluate_worker", lambda self, execution_id: pytest.fail("evaluated twice")
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(CrewRunApp, "_open_report", lambda self, url: opened.append(url))
+
+    app.on_button_pressed(SimpleNamespace(button=SimpleNamespace(id="btn-eval")))
+
+    assert opened == ["https://optimize.example/e/1"]
+    app._telemetry.feature_usage_span.assert_not_called()
+
+
+def test_an_evaluation_that_stopped_can_be_tried_again(monkeypatch) -> None:
+    """A timeout or a 502 is worth another press, and the run is still there to
+    grade — only a finished one sends the reader to its report instead."""
+    app = CrewRunApp()
+    app._status = "completed"
+    app._telemetry = Mock()
+    app._execution_uuid = "run-this-app"
+    app._evaluation = {"state": "failed", "error": "AMP answered 502."}
+    monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: True)
+    started: list[str] = []
+    monkeypatch.setattr(
+        CrewRunApp,
+        "_evaluate_worker",
+        lambda self, execution_id: started.append(execution_id),
+    )
+
+    app.action_evaluate_crew()
+
+    assert started == ["run-this-app"]
+
+
+def test_a_login_that_cannot_be_read_is_shown_on_screen(monkeypatch, tmp_path) -> None:
+    """A credential that exists but cannot be read stops the evaluation, and
+    the sentence has to reach the screen: printing it would land under the
+    layout, and exiting would take it away."""
+    monkeypatch.chdir(tmp_path)  # a stopped evaluation is noted in .shards_ai_agents/
+    from shards_ai_agents_cli.experimental import eval_crew
+
+    app = CrewRunApp()
+    app._evaluation = {"state": "starting"}
+    monkeypatch.setattr(
+        CrewRunApp, "call_from_thread", lambda self, handler, *args: handler(*args)
+    )
+
+    def broken_store():
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(eval_crew, "get_auth_token", broken_store)
+
+    app._evaluate_now("run-this-app")
+
+    assert app._evaluation["state"] == "failed"
+    assert "Could not read the saved login" in app._evaluation["error"]
+    assert "shards-agents login" in app._evaluation["error"]
+
+
+def test_an_exit_with_no_reason_says_that_rather_than_its_code(monkeypatch, tmp_path) -> None:
+    """Nothing on this path should exit any more, but an exit carries a code
+    and `1` on screen is not an answer."""
+    monkeypatch.chdir(tmp_path)  # a stopped evaluation is noted in .shards_ai_agents/
+    app = CrewRunApp()
+    app._evaluation = {"state": "starting"}
+    monkeypatch.setattr(
+        CrewRunApp, "call_from_thread", lambda self, handler, *args: handler(*args)
+    )
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.experimental.eval_crew.evaluate_run",
+        Mock(side_effect=SystemExit(1)),
+    )
+
+    app._evaluate_now("run-this-app")
+
+    assert app._evaluation["state"] == "failed"
+    assert app._evaluation["error"] == (
+        "The evaluation stopped without saying why (exit 1)."
+    )
+
+
+def test_the_evaluation_shows_its_link_its_progress_and_its_verdict() -> None:
+    """Everything the reader came for is on the run's own screen."""
+    app = CrewRunApp()
+    app._evaluation = {"state": "starting"}
+    app._evaluation_started({"id": "ev-1", "url": "https://optimize.example/e/1"})
+    app._open_report = lambda url: None  # type: ignore[method-assign]
+
+    line = Text()
+    app._append_evaluation(line)
+    assert "Evaluating this run" in line.plain
+    assert "https://optimize.example/e/1" in line.plain
+
+    app._evaluation_progress({"events": [{"data": {"subject": "the final output", "planned": 9}}]})
+    line = Text()
+    app._append_evaluation(line)
+    assert "judged 1 of 9" in line.plain
+
+    app._evaluation_finished(
+        {"status": "done", "verdict": {"gate": "passed", "grades": {"goal": 5, "tools": None}}}
+    )
+    line = Text()
+    app._append_evaluation(line)
+    assert "Goal gate PASSED" in line.plain
+    assert "goal 5/5" in line.plain and "tools —/5" in line.plain
+    assert "https://optimize.example/e/1" in line.plain
+
+
+def test_an_evaluation_that_stopped_says_so_where_it_was_running() -> None:
+    app = CrewRunApp()
+    app._evaluation = {"state": "running", "url": "https://optimize.example/e/1"}
+    app._evaluation_failed("AMP answered 404 for run x.")
+
+    line = Text()
+    app._append_evaluation(line)
+    assert "Evaluation stopped" in line.plain
+    assert "AMP answered 404 for run x." in line.plain
+
+
+@pytest.mark.parametrize("why", ["not traced at all", "another run replaced the record"])
+def test_evaluate_on_a_run_that_was_not_traced_runs_it_again_traced(monkeypatch, why) -> None:
+    """A run with no session of its own, or whose trace never reached AMP, has
+    nothing to grade — and a record naming a DIFFERENT run is not evidence that
+    this one was traced. Tracing is on for the project, so nothing is asked:
+    the app closes and the run happens again, traced, and is evaluated
+    (`run_crew._chain_traced_rerun`)."""
+    # tracing not turned off (the suite's `.env.test` turns it off), and on
+    monkeypatch.delenv("SHARDS_AI_AGENTS_TRACING_ENABLED", raising=False)
+    # the run traces to this machine's own AMP (`.env.test` names a fake one)
+    monkeypatch.delenv("SHARDS_AI_AGENTS_PLUS_URL", raising=False)
+    # A token the project's `.env` brought (a conversational flow loads it with
+    # `load_dotenv`) does not decide anything: only the AMP the run traces to.
+    monkeypatch.setenv("SHARDS_AI_AGENTS_USER_PAT", "the-projects-own")
+    monkeypatch.setattr("shards_ai_agents_core.user_data.is_tracing_enabled", lambda: True)
+    app = CrewRunApp()
+    app._status = "completed"
+    app._crew_result = object()
+    app._telemetry = Mock()
+    app._execution_uuid = None if why == "not traced at all" else "run-this-app"
+    app._unsubscribe = lambda: None  # type: ignore[method-assign]
+    app.notify = lambda *a, **k: pytest.fail("no notice: it just runs again")  # type: ignore[method-assign]
+    exits: list[object] = []
+    app.exit = lambda result=None: exits.append(result)  # type: ignore[method-assign]
+    monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: False)
+
+    app.action_evaluate_crew()
+
+    assert app._want_traced_rerun is True
+    assert exits == [app._crew_result]
+    assert app._evaluation is None
+
+
+def test_a_run_shards_ai_agents_eval_started_is_traced_with_nobody_at_the_screen(
+    monkeypatch, tmp_path
+) -> None:
+    """The run `shards-agents eval` started to grade: running the command was the yes,
+    whatever the terminal, the suite or the project's `.env` say."""
+    utils = "shards_ai_agents.events.listeners.tracing.utils"
+    monkeypatch.setattr(f"{utils}._is_test_environment", lambda: True)
+    monkeypatch.setattr(f"{utils}._is_interactive_terminal", lambda: False)
+    monkeypatch.setenv("SHARDS_AI_AGENTS_TRACING_ENABLED", "false")
+    app = CrewRunApp()
+
+    assert app._tracing_was_asked_for() is False
+    with crew_run_tui.evaluating_after_run():
+        assert app._tracing_was_asked_for() is True
+    assert app._tracing_was_asked_for() is False
+
+
+def test_the_token_this_app_sets_is_the_one_shards_ai_agentss_tracing_reads(
+    monkeypatch, tmp_path
+) -> None:
+    """The run app keeps its own copy of the handshake (it also runs against a
+    project's older shards-ai-agents-core), so the two are pinned to one variable and one
+    folder: a run `shards-agents eval` started is approved for upload in the child."""
+    from shards_ai_agents_core import eval_handshake
+
+    monkeypatch.undo()  # the real folders, not the per-test ones
+    assert crew_run_tui._AWAITING_EVAL_ENV == eval_handshake.AWAITING_ENV
+    assert crew_run_tui._awaiting_dir() == eval_handshake.awaiting_dir()
+    # both pinned to the account's home: a `.env` moving HOME moves neither
+    monkeypatch.setenv("HOME", str(tmp_path / "planted-home"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "planted-data"))
+    assert crew_run_tui._awaiting_dir() == eval_handshake.awaiting_dir()
+    assert not str(eval_handshake.awaiting_dir()).startswith(str(tmp_path))
+
+    folder = tmp_path / "eval-awaiting"
+    monkeypatch.setattr(crew_run_tui, "_awaiting_dir", lambda: folder)
+    monkeypatch.setattr(eval_handshake, "awaiting_dir", lambda: folder)
+    assert eval_handshake.run_awaited_by_evaluation() is False
+    with crew_run_tui.evaluating_after_run(
+        trusted_amp_origins=["https://app.shards-ai-agents.invalid"], tracing_turned_on=True
+    ):
+        assert eval_handshake.awaited_evaluation() == {
+            "trusted_amp_origins": ["https://app.shards-ai-agents.invalid"],
+            "tracing_turned_on": True,
+        }
+    assert eval_handshake.run_awaited_by_evaluation() is False
+
+
+@pytest.mark.parametrize(
+    "opened_for", ["an evaluation that turned tracing on", "an evaluation", "nothing"]
+)
+def test_the_app_says_where_the_trace_goes_only_when_its_evaluation_turned_tracing_on(
+    monkeypatch, opened_for
+) -> None:
+    """Said once, plainly, the time the yes is inferred and tracing turned on
+    for the project; after that the project traces and nothing more is said."""
+    notices: list[tuple[str, dict[str, object]]] = []
+
+    def mount() -> None:
+        app = CrewRunApp()
+        app._subscribe = lambda: None  # type: ignore[method-assign]
+        app.set_interval = lambda *a, **k: None  # type: ignore[method-assign]
+        app.notify = lambda message, **kwargs: notices.append((message, kwargs))  # type: ignore[method-assign]
+        app.on_mount()
+
+    if opened_for == "nothing":
+        mount()
+    else:
+        with crew_run_tui.evaluating_after_run(
+            tracing_turned_on=opened_for == "an evaluation that turned tracing on"
+        ):
+            mount()
+
+    if opened_for == "an evaluation that turned tracing on":
+        assert notices == [
+            (
+                "Tracing is now on for this project, so this run can be evaluated: "
+                "its trace is sent to Shards-ai-agents AMP, which grades it.",
+                {"title": "Evaluate", "timeout": 10},
+            )
+        ]
+    else:
+        assert notices == []
+
+
+def test_a_child_app_reads_the_note_off_the_token_file(monkeypatch) -> None:
+    """In a child process there is no holder: the file the command wrote says it."""
+    notices: list[str] = []
+    with crew_run_tui.evaluating_after_run(tracing_turned_on=True):
+        token = crew_run_tui._AUTO_EVAL.set(None)  # as a child process sees it
+        try:
+            app = CrewRunApp()
+            app.notify = lambda message, **kwargs: notices.append(message)  # type: ignore[method-assign]
+            app._say_this_run_will_be_evaluated()
+        finally:
+            crew_run_tui._AUTO_EVAL.reset(token)
+
+    assert notices == [crew_run_tui.EVALUATION_NOTICE]
+
+
+def test_a_crew_that_sets_tracing_false_is_never_told_its_trace_is_sent() -> None:
+    notices: list[str] = []
+    with crew_run_tui.evaluating_after_run(tracing_turned_on=True):
+        app = CrewRunApp()
+        app._crew = SimpleNamespace(tracing=False)
+        app.notify = lambda message, **kwargs: notices.append(message)  # type: ignore[method-assign]
+        app._say_this_run_will_be_evaluated()
+
+    assert notices == []
+
+
+@pytest.mark.parametrize("what", ["crew", "flow"])
+def test_evaluate_on_a_run_that_sets_tracing_false_says_why_and_runs_nothing(
+    monkeypatch, what
+) -> None:
+    """Running it again could not make a trace: nothing to pay for."""
+    app = CrewRunApp()
+    app._status = "completed"
+    app._telemetry = Mock()
+    app._execution_uuid = "run-this-app"
+    if what == "crew":
+        app._crew = SimpleNamespace(tracing=False)
+    else:
+        app._flow = SimpleNamespace(tracing=False)
+    app.exit = lambda result=None: pytest.fail("nothing to run again")  # type: ignore[method-assign]
+    notices: list[tuple[str, dict[str, object]]] = []
+    app.notify = lambda message, **kwargs: notices.append((message, kwargs))  # type: ignore[method-assign]
+    monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: False)
+
+    app.action_evaluate_crew()
+
+    message, kwargs = notices[0]
+    assert "sets tracing=False, so its runs are not traced and cannot be evaluated" in message
+    assert kwargs["severity"] == "warning" and app._want_traced_rerun is False
+
+
+def test_tracing_asked_for_reads_the_declaration_but_keeps_the_other_guards(
+    monkeypatch,
+) -> None:
+    """The ContextVar is set where the crew is CONSTRUCTED, not on the worker
+    thread that later asks — but an app with nobody in front of it is still
+    nobody's yes."""
+    utils = "shards_ai_agents.events.listeners.tracing.utils"
+    monkeypatch.setattr(f"{utils}._is_test_environment", lambda: False)
+    monkeypatch.setattr(f"{utils}._is_interactive_terminal", lambda: True)
+    app = CrewRunApp()
+    app._crew = SimpleNamespace(tracing=True)
+
+    assert app._tracing_was_asked_for() is True
+    assert app._request_trace_consent() is True
+
+    app._crew = SimpleNamespace(tracing=None)
+    assert app._tracing_was_asked_for() is False
+
+    # embedded, redirected, or under test: the declaration is not a person
+    app._crew = SimpleNamespace(tracing=True)
+    monkeypatch.setattr(f"{utils}._is_interactive_terminal", lambda: False)
+    assert app._tracing_was_asked_for() is False
+    monkeypatch.setattr(f"{utils}._is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(f"{utils}._is_test_environment", lambda: True)
+    assert app._tracing_was_asked_for() is False
+
+
+def test_a_run_started_for_an_evaluation_evaluates_it_here(monkeypatch) -> None:
+    """`shards-agents eval` runs the crew when nothing is traced. The evaluation it
+    came for starts on this screen when the run ends — the app does not close
+    and leave somebody in a bare terminal watching for a link."""
+    monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: True)
+    started: list[str] = []
+    monkeypatch.setattr(
+        CrewRunApp,
+        "_evaluate_worker",
+        lambda self, execution_id: started.append(execution_id),
+    )
+    with crew_run_tui.evaluating_after_run() as watched:
+        app = CrewRunApp()
+        app._execution_uuid = "run-this-app"
+        app.exit = lambda result=None: pytest.fail("the app must stay open")  # type: ignore[method-assign]
+
+        app._evaluate_if_one_is_waiting()
+
+    assert started == ["run-this-app"]
+    assert watched["execution_id"] == "run-this-app"
+
+
+def test_a_child_process_run_reads_the_waiting_evaluation_off_its_environment(
+    monkeypatch,
+) -> None:
+    """A project's crew runs through `uv run …`, so the app is in another
+    process — the one thing that crosses is the environment the command passed
+    it."""
+    monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: True)
+    started: list[str] = []
+    monkeypatch.setattr(
+        CrewRunApp,
+        "_evaluate_worker",
+        lambda self, execution_id: started.append(execution_id),
+    )
+
+    def the_child() -> None:
+        # a fresh context: that variable, and nothing this process holds in memory
+        assert crew_run_tui._AUTO_EVAL.get() is None
+        app = CrewRunApp()
+        app._execution_uuid = "run-in-the-child"
+        app.exit = lambda result=None: pytest.fail("the app must stay open")  # type: ignore[method-assign]
+        app._evaluate_if_one_is_waiting()
+
+    with crew_run_tui.evaluating_after_run():
+        contextvars.Context().run(the_child)
+
+    assert started == ["run-in-the-child"]
+
+
+@pytest.mark.parametrize("value", ["1", "true", "0" * 32])
+def test_a_project_env_cannot_say_an_evaluation_is_waiting(monkeypatch, value) -> None:
+    """The child loads the project's `.env` over its environment. A value the
+    command did not mint — with no token file behind it — is no handshake, so
+    a plain `shards-agents run` never starts an evaluation on its own."""
+    monkeypatch.setenv("SHARDS_AI_AGENTS_EVAL_AWAITING_RUN", value)
+
+    assert crew_run_tui._an_evaluation_is_waiting() is None
+
+
+def test_the_token_stops_counting_when_the_command_is_done(monkeypatch) -> None:
+    with crew_run_tui.evaluating_after_run():
+        passed = crew_run_tui.os.environ["SHARDS_AI_AGENTS_EVAL_AWAITING_RUN"]
+
+    monkeypatch.setenv("SHARDS_AI_AGENTS_EVAL_AWAITING_RUN", passed)
+    assert crew_run_tui._an_evaluation_is_waiting() is None
+
+
+def test_a_run_with_no_trace_says_so_instead_of_evaluating(monkeypatch) -> None:
+    monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: False)
+    marked: list[str | None] = []
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.experimental.eval_crew.record_evaluation_outcome", marked.append
+    )
+    monkeypatch.setattr(
+        CrewRunApp,
+        "_evaluate_worker",
+        lambda self, execution_id: pytest.fail("nothing to grade"),
+    )
+    with crew_run_tui.evaluating_after_run() as watched:
+        app = CrewRunApp()
+        app._execution_uuid = "run-this-app"
+        notices: list[str] = []
+        app.notify = lambda message, **kwargs: notices.append(message)  # type: ignore[method-assign]
+
+        app._evaluate_if_one_is_waiting()
+
+    assert watched["execution_id"] is None
+    assert "not traced" in notices[0]
+    # and the command waiting behind the screen is told, since it cannot see it
+    assert marked == [None]
+
+
+def test_a_run_that_failed_is_still_evaluated(monkeypatch) -> None:
+    """Where a run went wrong is what somebody asking for an evaluation wants
+    to know, and the trace it exported is still there."""
+    monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: True)
+    started: list[str] = []
+    monkeypatch.setattr(
+        CrewRunApp,
+        "_evaluate_worker",
+        lambda self, execution_id: started.append(execution_id),
+    )
+    with crew_run_tui.evaluating_after_run():
+        app = CrewRunApp()
+        app._status = "failed"
+        app._execution_uuid = "the-run-that-broke"
+
+        app._evaluate_if_one_is_waiting()
+
+    assert started == ["the-run-that-broke"]
+
+
+def test_a_run_nobody_is_waiting_on_evaluates_nothing() -> None:
+    app = CrewRunApp()
+    app.exit = lambda result=None: pytest.fail("the app must stay open")  # type: ignore[method-assign]
+
+    app._evaluate_if_one_is_waiting()
+
+    assert app._evaluation is None
+
+
+def test_evaluate_before_completion_records_nothing() -> None:
+    app = CrewRunApp()
+    app._status = "running"
+    app._telemetry = Mock()
+
+    app.action_evaluate_crew()
+
+    app._telemetry.feature_usage_span.assert_not_called()
+    assert app._evaluation is None
+
+
+def test_conversation_turn_done_records_assistant_message() -> None:
+    class RawResult:
+        raw = "hello from the flow"
+
+    app = CrewRunApp(conversational=True)
+    app._conversation_turn_in_progress = True
+    app._enable_conversation_input = lambda: None  # type: ignore[method-assign]
+    app._tick = lambda: None  # type: ignore[method-assign]
+    app._scroll_to_result = lambda: None  # type: ignore[method-assign]
+
+    app._on_conversation_turn_done(RawResult())
+
+    assert app._conversation_messages == [("assistant", "hello from the flow")]
+    assert app._conversation_turn_in_progress is False
+    assert app._status == "chatting"
+    assert isinstance(app._crew_result, RawResult)
+
+
+@pytest.mark.asyncio
+async def test_conversation_input_submits_turn() -> None:
+    class FakeFlow:
+        defer_trace_finalization = False
+
+        def handle_turn(self, message: str) -> str:
+            return f"reply: {message}"
+
+        def finalize_session_traces(self) -> None:
+            pass
+
+    app = CrewRunApp(crew_name="Demo", conversational=True)
+    app._flow = FakeFlow()
+
+    async with app.run_test() as pilot:
+        await pilot.click("#conversation-input")
+        await pilot.press("h", "i", "enter")
+        for _ in range(50):
+            await pilot.pause(0.05)
+            if app._conversation_messages[-1:] == [("assistant", "reply: hi")]:
+                break
+
+    assert app._conversation_messages == [
+        ("user", "hi"),
+        ("assistant", "reply: hi"),
+    ]
+
+
+def test_plan_step_status_updates_only_the_explicit_step() -> None:
+    app = _app_with_plan()
+
+    app._set_plan_step_status(2, "done")
+
+    assert app._plan_step_status == {
+        1: "pending",
+        2: "done",
+        3: "pending",
+    }
+
+
+def test_step_observation_events_update_the_explicit_step() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            StepObservationStartedEvent(
+                agent_role="Agent",
+                step_number=2,
+                step_description="Second",
+            ),
+        )
+        if future:
+            future.result(timeout=5)
+
+        assert app._plan_step_status == {
+            1: "pending",
+            2: "active",
+            3: "pending",
+        }
+
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            StepObservationCompletedEvent(
+                agent_role="Agent",
+                step_number=2,
+                step_description="Second",
+                step_completed_successfully=True,
+            ),
+        )
+        if future:
+            future.result(timeout=5)
+    finally:
+        app._unsubscribe()
+
+    assert app._plan_step_status == {
+        1: "pending",
+        2: "done",
+        3: "pending",
+    }
+
+
+def test_plan_step_lifecycle_events_update_the_explicit_step() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        _emit_event(
+            PlanStepStartedEvent(
+                agent_role="Agent",
+                step_number=2,
+                step_description="Second",
+            )
+        )
+
+        assert app._plan_step_status == {
+            1: "pending",
+            2: "active",
+            3: "pending",
+        }
+
+        _emit_event(
+            PlanStepCompletedEvent(
+                agent_role="Agent",
+                step_number=2,
+                step_description="Second",
+                success=True,
+                result="done",
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert app._plan_step_status == {
+        1: "pending",
+        2: "done",
+        3: "pending",
+    }
+
+
+def test_failed_plan_step_lifecycle_event_marks_exact_step_failed() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        _emit_event(
+            PlanStepCompletedEvent(
+                agent_role="Agent",
+                step_number=2,
+                step_description="Second",
+                success=False,
+                error="Step failed",
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert app._plan_step_status == {
+        1: "pending",
+        2: "failed",
+        3: "pending",
+    }
+
+
+def test_tool_usage_events_do_not_advance_plan_steps() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            ToolUsageStartedEvent(tool_name="search", tool_args={"query": "Shards-ai-agents"}),
+        )
+        if future:
+            future.result(timeout=5)
+
+        now = datetime.now()
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            ToolUsageFinishedEvent(
+                tool_name="search",
+                tool_args={"query": "Shards-ai-agents"},
+                started_at=now,
+                finished_at=now,
+                output="result",
+            ),
+        )
+        if future:
+            future.result(timeout=5)
+    finally:
+        app._unsubscribe()
+
+    assert app._plan_step_status == {
+        1: "pending",
+        2: "pending",
+        3: "pending",
+    }
+
+
+def test_next_tool_does_not_mark_unfinished_tool_successful() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        _emit_event(
+            ToolUsageStartedEvent(tool_name="search", tool_args={"query": "Shards-ai-agents"}),
+        )
+        _emit_event(
+            ToolUsageStartedEvent(tool_name="scrape", tool_args={"url": "https://x"}),
+        )
+    finally:
+        app._unsubscribe()
+
+    assert app._log_entries[0]["status"] == "timeout"
+    assert app._log_entries[0]["result"] is None
+    assert app._log_entries[0]["error"] == (
+        "No result received before the next tool started"
+    )
+    assert app._log_entries[1]["status"] == "running"
+    assert app._plan_step_status == {
+        1: "pending",
+        2: "pending",
+        3: "pending",
+    }
+
+
+def test_internal_reasoning_function_call_is_hidden_from_activity_log() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            ToolUsageStartedEvent(
+                tool_name="create_reasoning_plan",
+                tool_args={"plan": "Plan", "steps": [], "ready": True},
+            ),
+        )
+        if future:
+            future.result(timeout=5)
+
+        now = datetime.now()
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            ToolUsageFinishedEvent(
+                tool_name="create_reasoning_plan",
+                tool_args={"plan": "Plan", "steps": [], "ready": True},
+                started_at=now,
+                finished_at=now,
+                output='{"plan":"Plan","steps":[],"ready":true}',
+            ),
+        )
+        if future:
+            future.result(timeout=5)
+
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            ToolUsageErrorEvent(
+                tool_name="create_reasoning_plan",
+                tool_args={"plan": "Plan", "steps": [], "ready": True},
+                error="internal planning fallback",
+            ),
+        )
+        if future:
+            future.result(timeout=5)
+    finally:
+        app._unsubscribe()
+
+    assert app._log_entries == []
+    assert app._current_task_steps == []
+
+
+def test_memory_save_events_are_shown_in_activity_log() -> None:
+    app = _app_with_plan()
+    app._current_task_idx = 1
+    app._subscribe()
+    try:
+        _emit_event(
+            MemorySaveStartedEvent(
+                value="2 memories (background)",
+                metadata={},
+                source_type="unified_memory",
+            )
+        )
+        _emit_event(
+            MemorySaveCompletedEvent(
+                value="2 memories saved",
+                metadata={},
+                save_time_ms=123,
+                source_type="unified_memory",
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert len(app._log_entries) == 1
+    assert app._log_entries[0]["tool_name"] == "memory_save"
+    assert app._log_entries[0]["status"] == "success"
+    assert app._log_entries[0]["args"] == "2 memories (background)"
+    assert app._log_entries[0]["result"] == "2 memories saved"
+    assert app._log_entries[0]["error"] is None
+    assert app._log_entries[0]["duration"] == 0.123
+    assert app._log_entries[0]["task_idx"] == 1
+
+
+def test_nested_memory_save_event_is_hidden_for_save_to_memory_tool() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        tool_args = {"contents": ["Fact to remember."]}
+        _emit_event(
+            ToolUsageStartedEvent(
+                tool_name="save_to_memory",
+                tool_args=tool_args,
+            )
+        )
+        _emit_event(
+            MemorySaveStartedEvent(
+                value="Fact to remember.",
+                metadata={},
+                source_type="unified_memory",
+            )
+        )
+        _emit_event(
+            MemorySaveCompletedEvent(
+                value="Fact to remember.",
+                metadata={},
+                save_time_ms=123,
+                source_type="unified_memory",
+            )
+        )
+        now = datetime.now()
+        _emit_event(
+            ToolUsageFinishedEvent(
+                tool_name="save_to_memory",
+                tool_args=tool_args,
+                started_at=now,
+                finished_at=now,
+                output="Saved to memory.",
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert len(app._log_entries) == 1
+    assert app._log_entries[0]["tool_name"] == "save_to_memory"
+    assert app._log_entries[0]["status"] == "success"
+    assert app._log_entries[0]["result"] == "Saved to memory."
+
+
+def test_memory_save_failure_is_shown_in_activity_log() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        _emit_event(
+            MemorySaveStartedEvent(
+                value="background save",
+                metadata={},
+                source_type="unified_memory",
+            )
+        )
+        _emit_event(
+            MemorySaveFailedEvent(
+                value="background save",
+                metadata={},
+                error="embedding connection failed",
+                source_type="unified_memory",
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert app._log_entries[0]["tool_name"] == "memory_save"
+    assert app._log_entries[0]["status"] == "error"
+    assert app._log_entries[0]["error"] == "embedding connection failed"
+    assert app._log_expanded == {0}
+
+
+def test_memory_save_completion_updates_timed_out_row() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        _emit_event(
+            MemorySaveStartedEvent(
+                value="9 memories (background)",
+                metadata={},
+                source_type="unified_memory",
+            )
+        )
+
+        app._log_entries[0]["status"] = "timeout"
+        app._log_entries[0]["error"] = "No result received before crew completed"
+        app._log_entries[0]["duration"] = 8.3
+
+        _emit_event(
+            MemorySaveCompletedEvent(
+                value="9 memories saved",
+                metadata={},
+                save_time_ms=8300,
+                source_type="unified_memory",
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert len(app._log_entries) == 1
+    assert app._log_entries[0]["tool_name"] == "memory_save"
+    assert app._log_entries[0]["status"] == "success"
+    assert app._log_entries[0]["result"] == "9 memories saved"
+    assert app._log_entries[0]["error"] is None
+    assert app._log_entries[0]["duration"] == 8.3
+
+
+def test_memory_save_completion_with_unmatched_id_does_not_update_running_row() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        _emit_event(
+            MemorySaveStartedEvent(
+                value="first background save",
+                metadata={},
+                source_type="unified_memory",
+                parent_event_id="manual-parent",
+            )
+        )
+        _emit_event(
+            MemorySaveStartedEvent(
+                value="second background save",
+                metadata={},
+                source_type="unified_memory",
+                parent_event_id="manual-parent",
+            )
+        )
+
+        _emit_event(
+            MemorySaveCompletedEvent(
+                value="orphan save completed",
+                metadata={},
+                save_time_ms=2800,
+                source_type="unified_memory",
+                parent_event_id="manual-parent",
+                started_event_id="missing-memory-save-start",
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert [entry["status"] for entry in app._log_entries] == [
+        "running",
+        "running",
+        "success",
+    ]
+    assert app._log_entries[0]["args"] == "first background save"
+    assert app._log_entries[1]["args"] == "second background save"
+    assert app._log_entries[2]["result"] == "orphan save completed"
+    assert app._log_entries[2]["started_event_id"] == "missing-memory-save-start"
+
+
+def test_memory_save_failure_with_unmatched_id_does_not_update_running_row() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        _emit_event(
+            MemorySaveStartedEvent(
+                value="first background save",
+                metadata={},
+                source_type="unified_memory",
+                parent_event_id="manual-parent",
+            )
+        )
+        _emit_event(
+            MemorySaveStartedEvent(
+                value="second background save",
+                metadata={},
+                source_type="unified_memory",
+                parent_event_id="manual-parent",
+            )
+        )
+
+        _emit_event(
+            MemorySaveFailedEvent(
+                value="orphan save failed",
+                metadata={},
+                error="embedding connection failed",
+                source_type="unified_memory",
+                parent_event_id="manual-parent",
+                started_event_id="missing-memory-save-start",
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert [entry["status"] for entry in app._log_entries] == [
+        "running",
+        "running",
+        "error",
+    ]
+    assert app._log_entries[0]["args"] == "first background save"
+    assert app._log_entries[1]["args"] == "second background save"
+    assert app._log_entries[2]["args"] == "orphan save failed"
+    assert app._log_entries[2]["error"] == "embedding connection failed"
+    assert app._log_entries[2]["started_event_id"] == "missing-memory-save-start"
+    assert app._log_expanded == {2}
+
+
+def test_memory_save_completion_without_id_does_not_update_stale_row() -> None:
+    app = _app_with_plan()
+    now = time.time()
+    app._log_entries = [
+        {
+            "tool_name": "memory_save",
+            "status": "running",
+            "args": "current background save",
+            "result": None,
+            "error": None,
+            "start_time": now,
+            "duration": None,
+            "task_idx": 1,
+        },
+        {
+            "tool_name": "memory_save",
+            "status": "success",
+            "args": "stale background save",
+            "result": "stale save completed",
+            "error": None,
+            "start_time": now - 10,
+            "duration": 1.0,
+            "task_idx": 1,
+        },
+    ]
+
+    app._subscribe()
+    try:
+        _emit_event(
+            MemorySaveCompletedEvent(
+                value="current save completed",
+                metadata={},
+                save_time_ms=2800,
+                source_type="unified_memory",
+                parent_event_id="manual-parent",
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert [entry["status"] for entry in app._log_entries] == [
+        "success",
+        "success",
+    ]
+    assert app._log_entries[0]["args"] == "current background save"
+    assert app._log_entries[0]["result"] == "current save completed"
+    assert app._log_entries[1]["args"] == "stale background save"
+    assert app._log_entries[1]["result"] == "stale save completed"
+
+
+def test_memory_save_failure_without_id_does_not_update_stale_row() -> None:
+    app = _app_with_plan()
+    now = time.time()
+    app._log_entries = [
+        {
+            "tool_name": "memory_save",
+            "status": "running",
+            "args": "current background save",
+            "result": None,
+            "error": None,
+            "start_time": now,
+            "duration": None,
+            "task_idx": 1,
+        },
+        {
+            "tool_name": "memory_save",
+            "status": "success",
+            "args": "stale background save",
+            "result": "stale save completed",
+            "error": None,
+            "start_time": now - 10,
+            "duration": 1.0,
+            "task_idx": 1,
+        },
+    ]
+
+    app._subscribe()
+    try:
+        _emit_event(
+            MemorySaveFailedEvent(
+                value="current save failed",
+                metadata={},
+                error="embedding connection failed",
+                source_type="unified_memory",
+                parent_event_id="manual-parent",
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert [entry["status"] for entry in app._log_entries] == ["error", "success"]
+    assert app._log_entries[0]["args"] == "current background save"
+    assert app._log_entries[0]["error"] == "embedding connection failed"
+    assert app._log_entries[1]["args"] == "stale background save"
+    assert app._log_entries[1]["result"] == "stale save completed"
+    assert app._log_entries[1]["error"] is None
+    assert app._log_expanded == {0}
+
+
+def test_memory_save_payloads_are_truncated_in_activity_log() -> None:
+    app = _app_with_plan()
+    long_args = "a" * (_LOG_ARGS_TEXT_LIMIT + 10)
+    long_result = "r" * (_LOG_RESULT_TEXT_LIMIT + 10)
+
+    app._subscribe()
+    try:
+        _emit_event(
+            MemorySaveStartedEvent(
+                value=long_args,
+                metadata={},
+                source_type="unified_memory",
+            )
+        )
+        _emit_event(
+            MemorySaveCompletedEvent(
+                value=long_result,
+                metadata={},
+                save_time_ms=8300,
+                source_type="unified_memory",
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert len(app._log_entries[0]["args"]) == _LOG_ARGS_TEXT_LIMIT
+    assert app._log_entries[0]["args"].endswith(_LOG_TRUNCATION_SUFFIX)
+    assert len(app._log_entries[0]["result"]) == _LOG_RESULT_TEXT_LIMIT
+    assert app._log_entries[0]["result"].endswith(_LOG_TRUNCATION_SUFFIX)
+
+
+def test_starting_next_tool_does_not_timeout_memory_save() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        _emit_event(
+            MemorySaveStartedEvent(
+                value="9 memories (background)",
+                metadata={},
+                source_type="unified_memory",
+            )
+        )
+        _emit_event(
+            ToolUsageStartedEvent(
+                tool_name="read_website_content",
+                tool_args={"url": "https://example.com"},
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert app._log_entries[0]["tool_name"] == "memory_save"
+    assert app._log_entries[0]["status"] == "running"
+    assert app._log_entries[0]["error"] is None
+    assert app._log_entries[1]["tool_name"] == "read_website_content"
+    assert app._log_entries[1]["status"] == "running"
+
+
+def test_tool_failure_does_not_override_successful_plan_step_completion() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        _emit_event(
+            PlanStepStartedEvent(
+                agent_role="Agent",
+                step_number=1,
+                step_description="First",
+            )
+        )
+        _emit_event(
+            ToolUsageStartedEvent(
+                tool_name="search_the_internet_with_serper",
+                tool_args={"search_query": "Shards-ai-agents release"},
+                plan_step_number=1,
+                plan_step_description="First",
+            )
+        )
+        _emit_event(
+            ToolUsageErrorEvent(
+                tool_name="search_the_internet_with_serper",
+                tool_args={"search_query": "Shards-ai-agents release"},
+                plan_step_number=1,
+                plan_step_description="First",
+                error="No results",
+            )
+        )
+        _emit_event(
+            PlanStepCompletedEvent(
+                agent_role="Agent",
+                step_number=1,
+                step_description="First",
+                success=True,
+                result="Recovered with another source",
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert app._plan_step_status == {
+        1: "done",
+        2: "pending",
+        3: "pending",
+    }
+
+
+def test_tool_event_step_metadata_is_stored_in_activity_log() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        _emit_event(
+            ToolUsageStartedEvent(
+                tool_name="search_the_internet_with_serper",
+                tool_args={"search_query": "Shards-ai-agents release"},
+                plan_step_number=2,
+                plan_step_description="Second",
+            )
+        )
+        now = datetime.now()
+        _emit_event(
+            ToolUsageFinishedEvent(
+                tool_name="search_the_internet_with_serper",
+                tool_args={"search_query": "Shards-ai-agents release"},
+                plan_step_number=2,
+                plan_step_description="Second",
+                started_at=now,
+                finished_at=now,
+                output="Found official source",
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert app._log_entries[0]["plan_step_number"] == 2
+    assert app._plan_step_status == {
+        1: "pending",
+        2: "pending",
+        3: "pending",
+    }
+
+
+def test_starting_next_tool_does_not_infer_plan_step_progress() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        _emit_event(
+            ToolUsageStartedEvent(
+                tool_name="search_the_internet_with_serper",
+                tool_args={"search_query": "Shards-ai-agents release"},
+            )
+        )
+        _emit_event(
+            ToolUsageErrorEvent(
+                tool_name="search_the_internet_with_serper",
+                tool_args={"search_query": "Shards-ai-agents release"},
+                error="No results",
+            )
+        )
+        _emit_event(
+            ToolUsageStartedEvent(
+                tool_name="read_website_content",
+                tool_args={"url": "https://example.com"},
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert app._log_entries[0]["status"] == "error"
+    assert app._log_entries[1]["status"] == "running"
+    assert app._plan_step_status == {
+        1: "pending",
+        2: "pending",
+        3: "pending",
+    }
+
+
+@pytest.mark.asyncio
+async def test_crew_done_does_not_mark_unfinished_tool_successful() -> None:
+    app = _app_with_plan()
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        app._plan_step_status = {1: "failed", 2: "done", 3: "pending"}
+        app._log_entries = [
+            {
+                "tool_name": "search",
+                "status": "running",
+                "args": '{"query": "Shards-ai-agents"}',
+                "result": None,
+                "error": None,
+                "start_time": time.time() - 2,
+                "duration": None,
+                "task_idx": 1,
+            }
+        ]
+
+        app._on_crew_done("final output")
+        await pilot.pause()
+
+    assert app._log_entries[0]["status"] == "timeout"
+    assert app._log_entries[0]["result"] is None
+    assert app._log_entries[0]["error"] == "No result received before crew completed"
+    assert app._plan_step_status == {1: "failed", 2: "done", 3: "done"}
+
+
+@pytest.mark.asyncio
+async def test_flow_done_uses_flow_wording_for_unfinished_tool() -> None:
+    # The shared completion handler reports "flow" (not "crew") in flow mode.
+    app = CrewRunApp(crew_name="Demo Flow")
+    app._flow = SimpleNamespace()
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        app._log_entries = [
+            {
+                "tool_name": "search",
+                "status": "running",
+                "args": None,
+                "result": None,
+                "error": None,
+                "start_time": time.time() - 2,
+                "duration": None,
+                "task_idx": 1,
+            }
+        ]
+        app._on_crew_done("final output")
+        await pilot.pause()
+
+    assert app._log_entries[0]["error"] == "No result received before flow completed"
+
+
+@pytest.mark.asyncio
+async def test_crew_done_does_not_timeout_memory_save() -> None:
+    app = _app_with_plan()
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        app._log_entries = [
+            {
+                "tool_name": "memory_save",
+                "status": "running",
+                "args": "9 memories (background)",
+                "result": None,
+                "error": None,
+                "start_time": time.time() - 8,
+                "duration": None,
+                "task_idx": 1,
+            },
+            {
+                "tool_name": "search",
+                "status": "running",
+                "args": '{"query": "Shards-ai-agents"}',
+                "result": None,
+                "error": None,
+                "start_time": time.time() - 2,
+                "duration": None,
+                "task_idx": 1,
+            },
+        ]
+
+        app._on_crew_done("final output")
+        await pilot.pause()
+
+    assert app._log_entries[0]["status"] == "running"
+    assert app._log_entries[0]["error"] is None
+    assert app._log_entries[1]["status"] == "timeout"
+    assert app._log_entries[1]["error"] == "No result received before crew completed"
+
+
+async def _seconds_until_unsubscribed(
+    app: CrewRunApp, pilot: Pilot[Any], since: float
+) -> float:
+    # Assert only a lower bound on the result: a loaded machine can make the
+    # drain timer seconds late, but Textual fires it at most ~0.5ms early. The
+    # 30s cap stays under the suite's --timeout=60 and costs only on failure.
+    while app._event_handlers and time.monotonic() - since < 30:
+        await pilot.pause(0.01)
+    return time.monotonic() - since
+
+
+@pytest.mark.asyncio
+async def test_crew_done_keeps_memory_save_subscription_until_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.crew_run_tui._MEMORY_SAVE_DRAIN_GRACE_SECONDS", 0.05
+    )
+    app = _app_with_plan()
+    auto_unsubscribed = False
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        try:
+            assert app._event_handlers
+            started_event = MemorySaveStartedEvent(
+                value="9 memories (background)",
+                metadata={},
+                source_type="unified_memory",
+            )
+            _emit_event(started_event)
+
+            app._on_crew_done("final output")
+            await pilot.pause()
+
+            assert app._log_entries[0]["status"] == "running"
+            assert app._event_handlers
+
+            completed_at = time.monotonic()
+            _emit_event(
+                MemorySaveCompletedEvent(
+                    value="9 memories saved",
+                    metadata={},
+                    save_time_ms=8300,
+                    source_type="unified_memory",
+                    started_event_id=started_event.event_id,
+                )
+            )
+
+            # The handler ran on the bus's thread and the app's loop has not
+            # run since: only an unsubscribe the handler made itself shows here.
+            assert app._event_handlers
+            waited = await _seconds_until_unsubscribed(app, pilot, completed_at)
+            auto_unsubscribed = not app._event_handlers
+        finally:
+            app._unsubscribe()
+
+    assert app._log_entries[0]["tool_name"] == "memory_save"
+    assert app._log_entries[0]["status"] == "success"
+    assert app._log_entries[0]["result"] == "9 memories saved"
+    assert app._log_entries[0]["error"] is None
+    assert app._log_entries[0]["duration"] == 8.3
+    assert auto_unsubscribed is True
+    assert waited >= 0.045
+
+
+@pytest.mark.asyncio
+async def test_crew_done_waits_for_queued_memory_save_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.crew_run_tui._MEMORY_SAVE_DRAIN_GRACE_SECONDS", 0.05
+    )
+    app = _app_with_plan()
+    auto_unsubscribed = False
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        try:
+            assert app._event_handlers
+
+            app._on_crew_done("final output")
+
+            assert app._event_handlers
+            started_event = MemorySaveStartedEvent(
+                value="9 memories (background)",
+                metadata={},
+                source_type="unified_memory",
+                parent_event_id="manual-parent",
+            )
+            # No pause before the completion: the drain timer _on_crew_done
+            # armed must still be pending when it arrives. If it has already
+            # woken, its callback runs before the completion's re-arm and the
+            # app unsubscribes without a fresh grace. That is a product race,
+            # not a test artifact; remove this note once the app handles it.
+            _emit_event(started_event)
+
+            assert app._log_entries[0]["tool_name"] == "memory_save"
+            assert app._log_entries[0]["status"] == "running"
+
+            completed_at = time.monotonic()
+            _emit_event(
+                MemorySaveCompletedEvent(
+                    value="9 memories saved",
+                    metadata={},
+                    save_time_ms=8300,
+                    source_type="unified_memory",
+                    parent_event_id="manual-parent",
+                    started_event_id=started_event.event_id,
+                )
+            )
+
+            # The handler ran on the bus's thread and the app's loop has not
+            # run since: only an unsubscribe the handler made itself shows here.
+            assert app._event_handlers
+            waited = await _seconds_until_unsubscribed(app, pilot, completed_at)
+            auto_unsubscribed = not app._event_handlers
+        finally:
+            app._unsubscribe()
+
+    assert app._log_entries[0]["tool_name"] == "memory_save"
+    assert app._log_entries[0]["status"] == "success"
+    assert app._log_entries[0]["args"] == "9 memories (background)"
+    assert app._log_entries[0]["result"] == "9 memories saved"
+    assert app._log_entries[0]["error"] is None
+    assert app._log_entries[0]["duration"] == 8.3
+    assert auto_unsubscribed is True
+    assert waited >= 0.045
+
+
+@pytest.mark.asyncio
+async def test_crew_failed_does_not_timeout_memory_save() -> None:
+    app = _app_with_plan()
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        app._log_entries = [
+            {
+                "tool_name": "memory_save",
+                "status": "running",
+                "args": "9 memories (background)",
+                "result": None,
+                "error": None,
+                "start_time": time.time() - 8,
+                "duration": None,
+                "task_idx": 1,
+            },
+            {
+                "tool_name": "search",
+                "status": "running",
+                "args": '{"query": "Shards-ai-agents"}',
+                "result": None,
+                "error": None,
+                "start_time": time.time() - 2,
+                "duration": None,
+                "task_idx": 1,
+            },
+        ]
+
+        app._on_crew_failed("boom")
+        await pilot.pause()
+
+    assert app._log_entries[0]["status"] == "running"
+    assert app._log_entries[0]["error"] is None
+    assert app._log_entries[1]["status"] == "error"
+    assert app._log_entries[1]["error"] == "No result received before crew failed"
+
+
+def test_streamed_step_observation_updates_named_step_only() -> None:
+    app = _app_with_plan()
+
+    updated = app._try_parse_step_observation(
+        '{"step_completed_successfully":true,'
+        '"key_information_learned":"Step 2 succeeded with the official source."}'
+    )
+
+    assert updated is True
+    assert app._plan_step_status == {
+        1: "pending",
+        2: "done",
+        3: "pending",
+    }
+
+
+def test_failed_streamed_step_observation_marks_named_step_failed() -> None:
+    app = _app_with_plan()
+
+    updated = app._try_parse_step_observation(
+        '{"step_completed_successfully":false,'
+        '"key_information_learned":"Step 2 failed because the tool failed."}'
+    )
+
+    assert updated is True
+    assert app._plan_step_status == {
+        1: "pending",
+        2: "failed",
+        3: "pending",
+    }
+
+
+def test_streamed_goal_achieved_observation_collapses_remaining_steps_done() -> None:
+    app = _app_with_plan()
+
+    updated = app._try_parse_step_observation(
+        '{"step_number":2,'
+        '"step_completed_successfully":true,'
+        '"key_information_learned":"Goal is already satisfied.",'
+        '"goal_already_achieved":true}'
+    )
+
+    assert updated is True
+    assert app._plan_step_status == {
+        1: "done",
+        2: "done",
+        3: "done",
+    }
+
+
+def test_task_completion_collapses_pending_plan_steps_but_preserves_failed() -> None:
+    app = _app_with_plan()
+    app._plan_step_status = {1: "failed", 2: "done", 3: "pending"}
+
+    app._collapse_plan_on_task_done()
+
+    assert app._plan_step_status == {1: "failed", 2: "done", 3: "done"}
+
+
+def test_observation_failure_collapses_to_done_because_executor_continues() -> None:
+    app = _app_with_plan()
+    app._plan_step_status = {1: "done", 2: "active", 3: "pending"}
+    app._subscribe()
+    try:
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            StepObservationFailedEvent(
+                agent_role="Agent",
+                step_number=2,
+                step_description="Second",
+                error="observer timeout",
+            ),
+        )
+        if future:
+            future.result(timeout=5)
+    finally:
+        app._unsubscribe()
+
+    assert app._plan_step_status == {
+        1: "done",
+        2: "done",
+        3: "pending",
+    }
+
+
+def test_goal_achieved_event_collapses_remaining_steps_done() -> None:
+    app = _app_with_plan()
+    app._plan_step_status = {1: "done", 2: "active", 3: "pending"}
+    app._subscribe()
+    try:
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            GoalAchievedEarlyEvent(
+                agent_role="Agent",
+                step_number=2,
+                steps_completed=2,
+                steps_remaining=1,
+            ),
+        )
+        if future:
+            future.result(timeout=5)
+    finally:
+        app._unsubscribe()
+
+    assert app._plan_step_status == {
+        1: "done",
+        2: "done",
+        3: "done",
+    }
+
+
+def test_replan_event_keeps_old_plan_until_next_streamed_plan_replaces_it() -> None:
+    app = _app_with_plan()
+    app._subscribe()
+    try:
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            PlanReplanTriggeredEvent(
+                agent_role="Agent",
+                step_number=2,
+                replan_reason="Need updated sources",
+                replan_count=1,
+                completed_steps_preserved=1,
+            ),
+        )
+        if future:
+            future.result(timeout=5)
+    finally:
+        app._unsubscribe()
+
+    assert app._plan is not None
+    assert app._plan_step_status == {1: "pending", 2: "pending", 3: "pending"}
+    assert app._awaiting_replan is True
+
+    app._try_parse_plan(
+        '{"plan":"Updated plan","steps":['
+        '{"step_number":1,"description":"Updated first"},'
+        '{"step_number":2,"description":"Updated second"}]}'
+    )
+
+    assert app._plan == {
+        "plan": "Updated plan",
+        "steps": [
+            {"step_number": 1, "description": "Updated first"},
+            {"step_number": 2, "description": "Updated second"},
+        ],
+    }
+    assert app._plan_step_status == {1: "pending", 2: "pending"}
+    assert app._awaiting_replan is False
+
+
+def test_plan_refinement_updates_descriptions_without_new_statuses() -> None:
+    app = _app_with_plan()
+    app._plan_step_status = {1: "done", 2: "active", 3: "pending"}
+    app._subscribe()
+    try:
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            PlanRefinementEvent(
+                agent_role="Agent",
+                step_number=2,
+                refined_step_count=1,
+                refinements=["Step 3: Write the final answer from verified facts"],
+            ),
+        )
+        if future:
+            future.result(timeout=5)
+    finally:
+        app._unsubscribe()
+
+    assert app._plan_step_status == {
+        1: "done",
+        2: "done",
+        3: "pending",
+    }
+    assert app._plan["steps"][2]["description"] == (
+        "Write the final answer from verified facts"
+    )
+
+
+def test_step_observation_json_is_hidden_from_streaming_text() -> None:
+    app = _app_with_plan()
+
+    assert (
+        app._strip_step_observation_json(
+            'Visible before {"step_completed_successfully":true,'
+            '"key_information_learned":"Step 2 succeeded."} visible after'
+        )
+        == "Visible before  visible after"
+    )
+
+
+@pytest.mark.asyncio
+async def test_completed_run_keeps_activity_log_keyboard_navigation_active() -> None:
+    app = CrewRunApp()
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        app._log_entries = [_log_entry("search"), _log_entry("scrape")]
+
+        app._on_crew_done("final output")
+        await pilot.pause()
+
+        assert app.focused is app.query_one("#log-panel")
+
+        await pilot.press("down", "enter")
+        await pilot.pause()
+
+        assert app._log_cursor == 1
+        assert app._log_expanded == {1}
+
+        await pilot.press("up")
+        await pilot.pause()
+
+        assert app._log_cursor == 0
+
+
+class _FakeTask:
+    fingerprint = None
+
+    def __init__(self, task_id: str, name: str) -> None:
+        self.id = task_id
+        self.name = name
+        self.description = name
+
+
+def test_async_task_completion_marks_the_right_sidebar_row() -> None:
+    """Overlapping tasks: completing task 1 while task 2 runs must not
+    mark task 2 done, and starting task 2 must not mark task 1 done."""
+    from shards_ai_agents.events.types.task_events import TaskCompletedEvent, TaskStartedEvent
+    from shards_ai_agents.tasks.task_output import TaskOutput
+
+    app = CrewRunApp(total_tasks=2, task_names=["first", "second"])
+    app._subscribe()
+    try:
+        task1 = _FakeTask("id-1", "first")
+        task2 = _FakeTask("id-2", "second")
+
+        for task in (task1, task2):
+            future = shards_ai_agents_event_bus.emit(
+                None, TaskStartedEvent(context=None, task=task)
+            )
+            if future:
+                future.result(timeout=5)
+
+        # Both started: neither prematurely done
+        assert app._task_statuses == {1: "active", 2: "active"}
+
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            TaskCompletedEvent(
+                output=TaskOutput(description="first", raw="done", agent="a"),
+                task=task1,
+            ),
+        )
+        if future:
+            future.result(timeout=5)
+
+        assert app._task_statuses == {1: "done", 2: "active"}
+    finally:
+        app._unsubscribe()
+
+
+def test_pop_task_state_falls_back_to_current_task() -> None:
+    app = CrewRunApp(total_tasks=2, task_names=["first", "second"])
+    app._current_task_idx = 2
+    app._current_task_desc = "second"
+
+    class _Evt:
+        task = None
+        task_name = "unknown"
+
+    state = app._pop_task_state(_Evt())
+    assert state["idx"] == 2
+    assert state["desc"] == "second"
+
+
+def test_overlapping_task_logs_keep_their_own_state() -> None:
+    """Task 1 completing after task 2 started must log its own description,
+    agent, and output — and must not steal or reset task 2's stream state."""
+    from shards_ai_agents.events.types.task_events import TaskCompletedEvent, TaskStartedEvent
+    from shards_ai_agents.tasks.task_output import TaskOutput
+
+    app = CrewRunApp(total_tasks=2, task_names=["first", "second"])
+    app._subscribe()
+    try:
+        task1 = _FakeTask("id-1", "first")
+        task2 = _FakeTask("id-2", "second")
+
+        for task in (task1, task2):
+            future = shards_ai_agents_event_bus.emit(
+                None, TaskStartedEvent(context=None, task=task)
+            )
+            if future:
+                future.result(timeout=5)
+
+        # Task 2 is current and has streamed state in flight
+        app._task_full_output = "task two streaming output"
+        app._current_task_steps = [{"type": "llm", "summary": "thinking"}]
+
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            TaskCompletedEvent(
+                output=TaskOutput(
+                    description="first", raw="task one result", agent="a1"
+                ),
+                task=task1,
+            ),
+        )
+        if future:
+            future.result(timeout=5)
+
+        # Task 1's entry carries its own identity and output
+        entry1 = app._task_logs[-1]
+        assert entry1["idx"] == 1
+        assert entry1["desc"] == "first"
+        assert entry1["output"] == "task one result"
+        assert entry1["steps"] == []
+
+        # Task 2's in-flight stream state was not consumed or reset
+        assert app._task_full_output == "task two streaming output"
+        assert app._current_task_steps == [{"type": "llm", "summary": "thinking"}]
+
+        future = shards_ai_agents_event_bus.emit(
+            None,
+            TaskCompletedEvent(
+                output=TaskOutput(
+                    description="second", raw="task two result", agent="a2"
+                ),
+                task=task2,
+            ),
+        )
+        if future:
+            future.result(timeout=5)
+
+        entry2 = app._task_logs[-1]
+        assert entry2["idx"] == 2
+        assert entry2["desc"] == "second"
+        assert entry2["output"] == "task two streaming output"
+        assert any(step.get("summary") == "thinking" for step in entry2["steps"])
+    finally:
+        app._unsubscribe()
+
+
+# ── Declarative-flow (non-conversational) TUI support ───────
+
+
+def test_is_flow_run_gating() -> None:
+    """The flow-render gate must be true only for a non-conversational flow."""
+    crew_app = CrewRunApp(total_tasks=1)
+    crew_app._crew = SimpleNamespace()
+    assert crew_app._is_flow_run is False
+
+    conv_app = CrewRunApp(conversational=True)
+    conv_app._flow = SimpleNamespace()
+    assert conv_app._is_flow_run is False
+
+    flow_app = CrewRunApp()
+    flow_app._flow = SimpleNamespace()
+    assert flow_app._is_flow_run is True
+
+
+def test_flow_method_events_build_steps() -> None:
+    app = CrewRunApp(crew_name="Demo")
+    app._flow = SimpleNamespace()
+    app._flow_method_types = {"research": "crew", "summarize": "agent"}
+    app._subscribe()
+    try:
+        _emit_event(FlowStartedEvent(flow_name="Demo"))
+        assert app._status == "working"
+
+        _emit_event(
+            MethodExecutionStartedEvent(
+                flow_name="Demo", method_name="research", state={}
+            )
+        )
+        assert app._flow_steps == [
+            {"name": "research", "call_type": "crew", "status": "active"}
+        ]
+        assert app._current_method == "research"
+
+        _emit_event(
+            MethodExecutionFinishedEvent(
+                flow_name="Demo", method_name="research", result="ok", state={}
+            )
+        )
+        _emit_event(
+            MethodExecutionStartedEvent(
+                flow_name="Demo", method_name="summarize", state={}
+            )
+        )
+        _emit_event(
+            MethodExecutionFailedEvent(
+                flow_name="Demo",
+                method_name="summarize",
+                error=RuntimeError("boom"),
+            )
+        )
+    finally:
+        app._unsubscribe()
+
+    assert app._flow_steps == [
+        {"name": "research", "call_type": "crew", "status": "done"},
+        {"name": "summarize", "call_type": "agent", "status": "failed"},
+    ]
+    # The header must not keep spinning a method that already ended.
+    assert app._current_method is None
+
+
+def test_current_method_clears_and_falls_back_across_overlap() -> None:
+    app = CrewRunApp(crew_name="Demo")
+    app._flow = SimpleNamespace()
+    app._subscribe()
+    try:
+        _emit_event(
+            MethodExecutionStartedEvent(flow_name="Demo", method_name="a", state={})
+        )
+        _emit_event(
+            MethodExecutionStartedEvent(flow_name="Demo", method_name="b", state={})
+        )
+        assert app._current_method == "b"
+
+        # 'a' finishes while 'b' is still active → header stays on 'b'.
+        _emit_event(
+            MethodExecutionFinishedEvent(
+                flow_name="Demo", method_name="a", result=None, state={}
+            )
+        )
+        assert app._current_method == "b"
+
+        # 'b' finishes → nothing active left → header clears.
+        _emit_event(
+            MethodExecutionFinishedEvent(
+                flow_name="Demo", method_name="b", result=None, state={}
+            )
+        )
+        assert app._current_method is None
+    finally:
+        app._unsubscribe()
+
+
+def test_flow_method_transitions_clear_current_agent() -> None:
+    app = CrewRunApp(crew_name="Demo")
+    app._flow = SimpleNamespace()
+    app._subscribe()
+    try:
+        _emit_event(
+            MethodExecutionStartedEvent(flow_name="Demo", method_name="a", state={})
+        )
+        app._current_agent = "Researcher"  # an agent ran during method 'a'
+
+        # Starting a new method clears the previous method's agent.
+        _emit_event(
+            MethodExecutionStartedEvent(flow_name="Demo", method_name="b", state={})
+        )
+        assert app._current_agent == ""
+
+        app._current_agent = "Writer"
+        # 'b' ending switches the active method ('a' still active) → agent clears.
+        _emit_event(
+            MethodExecutionFinishedEvent(
+                flow_name="Demo", method_name="b", result=None, state={}
+            )
+        )
+        assert app._current_agent == ""
+    finally:
+        app._unsubscribe()
+
+
+def test_crew_kickoff_does_not_rename_flow_run() -> None:
+    # A `call: crew` step must not relabel the flow with the nested crew's name.
+    app = CrewRunApp(crew_name="My Flow")
+    app._flow = SimpleNamespace()
+    app._subscribe()
+    try:
+        _emit_event(CrewKickoffStartedEvent(crew_name="Nested Crew", inputs=None))
+        assert app._crew_name == "My Flow"
+        assert app._status == "working"
+    finally:
+        app._unsubscribe()
+
+
+def test_crew_kickoff_renames_in_crew_mode() -> None:
+    # Regression: crew runs still adopt the crew name from the event.
+    app = CrewRunApp(crew_name="Crew")
+    app._crew = SimpleNamespace()
+    app._subscribe()
+    try:
+        _emit_event(CrewKickoffStartedEvent(crew_name="Real Crew", inputs=None))
+        assert app._crew_name == "Real Crew"
+    finally:
+        app._unsubscribe()
+
+
+def test_method_paused_marks_step_paused() -> None:
+    app = CrewRunApp(crew_name="Demo")
+    app._flow = SimpleNamespace()
+    app._subscribe()
+    try:
+        _emit_event(
+            MethodExecutionStartedEvent(flow_name="Demo", method_name="ask", state={})
+        )
+        _emit_event(
+            MethodExecutionPausedEvent(
+                flow_name="Demo",
+                method_name="ask",
+                state={},
+                flow_id="flow-1",
+                message="Need your input",
+            )
+        )
+        assert app._flow_steps == [
+            {"name": "ask", "call_type": None, "status": "paused"}
+        ]
+        assert app._current_method == "ask"
+    finally:
+        app._unsubscribe()
+
+
+@pytest.mark.asyncio
+async def test_declarative_flow_runs_on_tui() -> None:
+    """End-to-end: on_mount dispatches _run_flow_worker → flow.kickoff →
+    _on_crew_done, and any still-active step is swept to done on completion."""
+    kicked: dict[str, object] = {}
+
+    class FakeFlow:
+        name = "Demo Flow"
+
+        def kickoff(self, inputs=None):
+            kicked["inputs"] = inputs
+            return "flow result"
+
+    app = CrewRunApp(crew_name="Demo Flow")
+    app._flow = FakeFlow()
+    app._flow_inputs = {"topic": "AI"}
+    # A step left active (no Finished event) must be swept to done by _on_crew_done.
+    app._flow_steps = [
+        {"name": "compute", "call_type": "expression", "status": "active"}
+    ]
+
+    async with app.run_test() as pilot:
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if app._status == "completed":
+                break
+
+    assert kicked["inputs"] == {"topic": "AI"}
+    assert app._status == "completed"
+    assert app._final_output == "flow result"
+    assert app._crew_result == "flow result"
+    assert app._flow_steps[0]["status"] == "done"
+
+
+def test_view_traces_keybinding_records_telemetry(monkeypatch) -> None:
+    """The `t` binding reaches the action directly, never on_button_pressed."""
+    app = CrewRunApp()
+    app._status = "completed"
+    app._telemetry = Mock()
+    notice = Mock()
+    monkeypatch.setattr(app, "notify", notice)
+
+    app.action_view_traces()
+
+    app._telemetry.feature_usage_span.assert_called_once_with("cli_usage:view_traces")
+    notice.assert_called_once()
+
+
+def test_deploy_keybinding_records_telemetry() -> None:
+    """The `d` binding reaches the action directly, never on_button_pressed."""
+    app = CrewRunApp()
+    app._status = "completed"
+    app._crew_result = object()
+    app._telemetry = Mock()
+    app._unsubscribe = lambda: None  # type: ignore[method-assign]
+    exits: list[object] = []
+    app.exit = lambda result: exits.append(result)  # type: ignore[method-assign]
+
+    app.action_deploy_crew()
+
+    app._telemetry.feature_usage_span.assert_called_once_with("cli_usage:deploy")
+    assert app._want_deploy is True
+    assert exits == [app._crew_result]
+
+
+def test_view_traces_before_completion_records_nothing() -> None:
+    """A keypress mid-run is a no-op, so it must not be counted as usage."""
+    app = CrewRunApp()
+    app._status = "running"
+    app._telemetry = Mock()
+
+    app.action_view_traces()
+
+    app._telemetry.feature_usage_span.assert_not_called()
+
+
+def test_deploy_before_completion_records_nothing() -> None:
+    app = CrewRunApp()
+    app._status = "running"
+    app._telemetry = Mock()
+
+    app.action_deploy_crew()
+
+    app._telemetry.feature_usage_span.assert_not_called()
+    assert app._want_deploy is False
+
+
+def test_button_press_records_exactly_once(monkeypatch) -> None:
+    """Recording moved into the action; the button must not double-count."""
+    app = CrewRunApp()
+    app._status = "completed"
+    app._telemetry = Mock()
+    monkeypatch.setattr(app, "notify", Mock())
+
+    app.on_button_pressed(SimpleNamespace(button=SimpleNamespace(id="btn-traces")))
+
+    assert app._telemetry.feature_usage_span.call_count == 1
+
+
+def test_try_parse_structured_rejects_non_serializable_literals() -> None:
+    """ast.literal_eval("[...]") is a valid [Ellipsis] list but cannot be JSON-encoded."""
+    assert _try_parse_structured("[...]") is None
+    assert _try_parse_structured("{'a': ...}") is None
+    assert _try_parse_structured("[1+2j]") is None
+
+
+def test_try_parse_structured_still_accepts_serializable_values() -> None:
+    assert _try_parse_structured('{"a": 1}') == {"a": 1}
+    assert _try_parse_structured("['x', 'y']") == ["x", "y"]
+    assert _try_parse_structured("{'a': 1}") == {"a": 1}
+
+
+def test_format_json_in_text_survives_literal_ellipsis() -> None:
+    """A streamed [...] must render as-is instead of crashing the TUI (issue #7434)."""
+    assert _format_json_in_text("pandas,[...]") == "pandas,[...]"
+
+
+def test_try_parse_structured_rejects_deeply_nested_input() -> None:
+    """A nesting depth no JSON backend can walk must parse as nothing, not recurse."""
+    deep = "[" * 100_000 + "]" * 100_000
+    assert _try_parse_structured(deep) is None
+
+
+def test_format_json_in_text_survives_deep_nesting() -> None:
+    """The render path must contain the failure instead of losing the TUI update."""
+    deep = "data: " + "[" * 4000 + "]" * 4000
+    assert isinstance(_format_json_in_text(deep), str)
+
+
+def test_json_the_render_encoder_cannot_walk_is_left_as_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Python 3.12's C decoder accepts nesting its indent encoder cannot walk.
+    The decoder here does that on every version, with an input `ast` cannot
+    rescue (`null`), so the render path must keep the text as it was."""
+    too_deep: list[Any] = []
+    for _ in range(100_000):
+        too_deep = [too_deep]
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.crew_run_tui._json",
+        SimpleNamespace(loads=lambda _text: too_deep, dumps=json.dumps),
+    )
+
+    assert _try_parse_structured('{"a": null}') is None
+    assert _format_json_in_text('data: {"a": null}') == 'data: {"a": null}'
+
+
+def test_format_json_in_text_still_pretty_prints_valid_json() -> None:
+    assert _format_json_in_text('data: {"a": 1} and [...]') == (
+        "data: " + '{\n  "a": 1\n}' + " and [...]"
+    )
+
+
+# --- what the run app's Deploy met before a deployment attempt ---------------
+
+
+@pytest.fixture
+def deploy_usage(monkeypatch) -> list[str]:
+    features: list[str] = []
+
+    class FakeTelemetry:
+        def set_tracer(self) -> None:
+            pass
+
+        def feature_usage_span(self, feature, attributes=None) -> None:
+            features.append(feature)
+
+    monkeypatch.setattr("shards_ai_agents_core.telemetry.Telemetry", FakeTelemetry)
+    return features
+
+
+def _deploy_doubles(monkeypatch, *, creates, login):
+    calls: list[str] = []
+
+    class FakeDeployCommand:
+        def create_crew(self, **kwargs) -> None:
+            calls.append("create")
+            outcome = creates.pop(0)
+            if outcome is not None:
+                raise outcome
+
+    class FakeAuthenticationCommand:
+        def login(self) -> None:
+            calls.append("login")
+            if login is not None:
+                raise login
+
+    monkeypatch.setattr("shards_ai_agents_cli.deploy.main.DeployCommand", FakeDeployCommand)
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.authentication.main.AuthenticationCommand",
+        FakeAuthenticationCommand,
+    )
+    return calls
+
+
+def test_a_logged_in_deploy_counts_no_hurdle(monkeypatch, deploy_usage) -> None:
+    calls = _deploy_doubles(monkeypatch, creates=[None], login=None)
+
+    run_crew._chain_deploy()
+
+    assert calls == ["create"]
+    assert deploy_usage == []
+
+
+def test_a_login_prompt_that_succeeds_counts_the_prompt_only(monkeypatch, deploy_usage) -> None:
+    calls = _deploy_doubles(
+        monkeypatch, creates=[AuthenticationRequiredError(), None], login=None
+    )
+
+    run_crew._chain_deploy()
+
+    assert calls == ["create", "login", "create"]
+    assert deploy_usage == ["cli_usage:deploy_login_prompted"]
+
+
+def test_still_not_logged_in_after_the_prompt_counts_why_and_says_so(
+    monkeypatch, capsys, deploy_usage
+) -> None:
+    _deploy_doubles(
+        monkeypatch,
+        creates=[AuthenticationRequiredError(), AuthenticationRequiredError()],
+        login=None,
+    )
+
+    run_crew._chain_deploy()
+
+    assert deploy_usage == [
+        "cli_usage:deploy_login_prompted",
+        "cli_usage:deploy_stopped:login_still_required",
+    ]
+    assert "Deploy failed: authentication is still required." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("raised", "reason"),
+    [
+        (KeyboardInterrupt(), "login_abandoned"),
+        (httpx.HTTPError("access_denied"), "login_failed"),
+        (SystemExit(1), "login_timed_out"),
+    ],
+)
+def test_a_login_that_ends_badly_is_counted_and_still_raised(
+    monkeypatch, deploy_usage, raised, reason
+) -> None:
+    """Counting must not change what the user sees: the error still escapes."""
+    calls = _deploy_doubles(
+        monkeypatch, creates=[AuthenticationRequiredError()], login=raised
+    )
+
+    with pytest.raises(type(raised)):
+        run_crew._chain_deploy()
+
+    assert calls == ["create", "login"]
+    assert deploy_usage == [
+        "cli_usage:deploy_login_prompted",
+        f"cli_usage:deploy_stopped:{reason}",
+    ]
+
+
+def test_a_failing_usage_count_never_changes_the_deploy(monkeypatch, capsys) -> None:
+    class BrokenTelemetry:
+        def set_tracer(self) -> None:
+            raise RuntimeError("exporter is down")
+
+    monkeypatch.setattr("shards_ai_agents_core.telemetry.Telemetry", BrokenTelemetry)
+    calls = _deploy_doubles(
+        monkeypatch,
+        creates=[AuthenticationRequiredError(), AuthenticationRequiredError()],
+        login=None,
+    )
+
+    run_crew._chain_deploy()
+
+    assert calls == ["create", "login", "create"]
+    assert "Deploy failed: authentication is still required." in capsys.readouterr().out
+
+
+def _amp_deploy_doubles(monkeypatch, *, statuses):
+    """A deploy whose creates get these AMP statuses, through the real
+    response check, and a login that succeeds."""
+    calls: list[str] = []
+
+    class FakeDeployCommand:
+        def create_crew(self, **kwargs) -> None:
+            calls.append("create")
+            status = statuses.pop(0)
+            if status != 200:
+                PlusAPIMixin._validate_response(
+                    self,
+                    httpx.Response(
+                        status,
+                        json={"error": "bad_credentials", "message": "Bad credentials"},
+                    ),
+                )
+
+    class FakeAuthenticationCommand:
+        def login(self) -> None:
+            calls.append("login")
+
+    monkeypatch.setattr("shards_ai_agents_cli.deploy.main.DeployCommand", FakeDeployCommand)
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.authentication.main.AuthenticationCommand",
+        FakeAuthenticationCommand,
+    )
+    return calls
+
+
+def test_a_saved_login_amp_rejects_is_replaced_and_the_deploy_retried(
+    monkeypatch, deploy_usage
+) -> None:
+    calls = _amp_deploy_doubles(monkeypatch, statuses=[401, 200])
+
+    run_crew._chain_deploy()
+
+    assert calls == ["create", "login", "create"]
+    assert deploy_usage == ["cli_usage:deploy_login_prompted"]
+
+
+def test_amp_rejecting_a_fresh_login_stops_after_one_login(
+    monkeypatch, capsys, deploy_usage
+) -> None:
+    """A 401 a new login cannot fix (no AMP user, not activated) must not loop."""
+    calls = _amp_deploy_doubles(monkeypatch, statuses=[401, 401])
+
+    run_crew._chain_deploy()
+
+    assert calls == ["create", "login", "create"]
+    assert deploy_usage == [
+        "cli_usage:deploy_login_prompted",
+        "cli_usage:deploy_stopped:login_still_required",
+    ]
+    output = capsys.readouterr().out
+    assert "Bad credentials" in output
+    assert "Deploy failed: authentication is still required." in output
+
+
+def test_a_deploy_amp_refuses_for_another_reason_does_not_ask_for_login(
+    monkeypatch, capsys, deploy_usage
+) -> None:
+    calls = _amp_deploy_doubles(monkeypatch, statuses=[403])
+
+    run_crew._chain_deploy()
+
+    assert calls == ["create"]
+    assert deploy_usage == []
+    assert "Deploy failed" in capsys.readouterr().out
+
+
+def test_the_real_logged_out_deploy_still_prompts_a_login_then_says_so(
+    monkeypatch, capsys, deploy_usage
+) -> None:
+    """The login error now exits 1; the chained deploy still matches it by type."""
+    calls: list[str] = []
+
+    def no_saved_login() -> str:
+        raise AuthError("No token")
+
+    class FakeAuthenticationCommand:
+        def login(self) -> None:
+            calls.append("login")
+
+    monkeypatch.setattr("shards_ai_agents_cli.command.get_auth_token", no_saved_login)
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.authentication.main.AuthenticationCommand",
+        FakeAuthenticationCommand,
+    )
+
+    run_crew._chain_deploy()
+
+    assert calls == ["login"]
+    assert deploy_usage == [
+        "cli_usage:deploy_login_prompted",
+        "cli_usage:deploy_stopped:login_still_required",
+    ]
+    assert "Deploy failed: authentication is still required." in capsys.readouterr().out
+
+
+# --- why an evaluation asked for on this screen never reached a verdict ------
+
+
+@pytest.fixture
+def stops(monkeypatch) -> list[str]:
+    """The `cli_usage:eval_stopped:*` features counted, in order."""
+    features: list[str] = []
+
+    class FakeTelemetry:
+        def set_tracer(self) -> None:
+            pass
+
+        def feature_usage_span(self, feature, attributes=None) -> None:
+            features.append(feature)
+
+    monkeypatch.setattr("shards_ai_agents_core.telemetry.Telemetry", FakeTelemetry)
+    return features
+
+
+@pytest.mark.parametrize("answer", [True, False])
+@pytest.mark.parametrize(
+    ("tracing", "asked_on"),
+    [
+        ("turned off", crew_run_tui.TurnTracingOnScreen),
+        ("never turned on", crew_run_tui.TraceConsentScreen),
+    ],
+)
+def test_evaluate_on_an_untraced_run_asks_before_tracing_is_turned_on(
+    monkeypatch, tmp_path, stops, answer, tracing, asked_on
+) -> None:
+    """The project said no to tracing, or nobody ever turned it on: only a yes
+    turns it on (in its .env) and runs the crew again; a no leaves everything
+    as it was. A project that never turned it on is asked on the screen a
+    run's trace is shared from."""
+    monkeypatch.chdir(tmp_path)
+    if tracing == "turned off":
+        (tmp_path / ".env").write_text("SHARDS_AI_AGENTS_TRACING_ENABLED=false\n")
+    monkeypatch.delenv("SHARDS_AI_AGENTS_TRACING_ENABLED", raising=False)
+    # the run traces to this machine's own AMP (`.env.test` names a fake one)
+    monkeypatch.delenv("SHARDS_AI_AGENTS_PLUS_URL", raising=False)
+    monkeypatch.setattr(
+        "shards_ai_agents_core.user_data.is_tracing_enabled",
+        lambda: os.environ.get("SHARDS_AI_AGENTS_TRACING_ENABLED") == "true",
+    )
+    app = CrewRunApp()
+    app._status = "completed"
+    app._crew_result = object()
+    app._telemetry = Mock()
+    app._execution_uuid = "run-this-app"
+    app._unsubscribe = lambda: None  # type: ignore[method-assign]
+    exits: list[object] = []
+    app.exit = lambda result=None: exits.append(result)  # type: ignore[method-assign]
+    pushed: list[tuple[object, object]] = []
+    app.push_screen = lambda screen, callback=None: pushed.append((screen, callback))  # type: ignore[method-assign]
+    monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: False)
+
+    app.action_evaluate_crew()
+
+    screen, answered = pushed[0]
+    assert type(screen) is asked_on and exits == []
+    answered(answer)
+    env = (tmp_path / ".env").read_text() if (tmp_path / ".env").exists() else ""
+    if answer:
+        assert "SHARDS_AI_AGENTS_TRACING_ENABLED=true" in env
+        assert app._want_traced_rerun is True and exits == [app._crew_result]
+        assert stops == []
+    else:
+        assert env == ("SHARDS_AI_AGENTS_TRACING_ENABLED=false\n" if tracing == "turned off" else "")
+        assert app._want_traced_rerun is False and exits == []
+        assert stops == ["cli_usage:eval_stopped:declined"]
+
+
+@pytest.mark.parametrize("tracing", ["turned off", "never turned on", "on"])
+def test_evaluate_toward_an_untrusted_amp_asks_nothing_and_writes_nothing(
+    monkeypatch, tmp_path, stops, tracing
+) -> None:
+    """The project's `.env` names an AMP this machine does not trust with its
+    login, logged in or not yet: `shards-agents eval` would refuse the re-run, so
+    nothing is asked, `.env` is left as it was, and the app says why instead
+    of closing."""
+    from shards_ai_agents_cli.experimental import eval_crew
+
+    monkeypatch.chdir(tmp_path)
+    env = "SHARDS_AI_AGENTS_PLUS_URL=https://evil.example\n"
+    if tracing == "turned off":
+        env += "SHARDS_AI_AGENTS_TRACING_ENABLED=false\n"
+    if tracing == "on":
+        env += "SHARDS_AI_AGENTS_TRACING_ENABLED=true\n"
+    (tmp_path / ".env").write_text(env)
+    monkeypatch.setenv("SHARDS_AI_AGENTS_PLUS_URL", "https://evil.example")  # the run's own load
+    monkeypatch.delenv("SHARDS_AI_AGENTS_TRACING_ENABLED", raising=False)
+    monkeypatch.setattr(
+        eval_crew,
+        "Settings",
+        lambda: SimpleNamespace(enterprise_base_url="https://app.shards-ai-agents.invalid"),
+    )
+    app = CrewRunApp()
+    app._status = "completed"
+    app._crew_result = object()
+    app._telemetry = Mock()
+    app._execution_uuid = "run-this-app"
+    app._unsubscribe = lambda: None  # type: ignore[method-assign]
+    exits: list[object] = []
+    app.exit = lambda result=None: exits.append(result)  # type: ignore[method-assign]
+    app.push_screen = lambda *a, **k: pytest.fail("nothing is asked")  # type: ignore[method-assign]
+    notices: list[str] = []
+    app.notify = lambda message, **k: notices.append(message)  # type: ignore[method-assign]
+    monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: False)
+
+    app.action_evaluate_crew()
+
+    assert exits == [] and app._want_traced_rerun is False
+    assert (tmp_path / ".env").read_text() == env
+    assert notices and "its trace would go to https://evil.example" in notices[0]
+    assert stops == ["cli_usage:eval_stopped:untrusted_amp"]
+
+
+def test_pressing_evaluate_on_an_untraced_run_counts_the_press_and_nothing_else(
+    monkeypatch, stops
+) -> None:
+    """It is not a stop: the run happens again, and `shards-agents eval` counts why it
+    ran the crew (`eval_ran_crew:run_again`) and how that ended."""
+    # tracing not turned off (the suite's `.env.test` turns it off)
+    monkeypatch.delenv("SHARDS_AI_AGENTS_TRACING_ENABLED", raising=False)
+    # the run traces to this machine's own AMP (`.env.test` names a fake one)
+    monkeypatch.delenv("SHARDS_AI_AGENTS_PLUS_URL", raising=False)
+    app = CrewRunApp()
+    app._status = "completed"
+    app._telemetry = Mock()
+    app._execution_uuid = "run-this-app"
+    app._unsubscribe = lambda: None  # type: ignore[method-assign]
+    app.exit = lambda result=None: None  # type: ignore[method-assign]
+    monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: False)
+
+    app.action_evaluate_crew()
+
+    app._telemetry.feature_usage_span.assert_called_once_with("cli_usage:evaluate")
+    assert stops == []
+
+
+def test_a_run_started_by_shards_ai_agents_eval_leaves_the_untraced_count_to_the_command(
+    monkeypatch, tmp_path, stops
+) -> None:
+    """The command waiting behind this screen says "not traced" and counts it;
+    counting it here as well would count one stop twice."""
+    monkeypatch.chdir(tmp_path)  # the app leaves its word in the project's .shards_ai_agents/
+    monkeypatch.setattr(crew_run_tui, "_trace_was_recorded", lambda uuid: False)
+    monkeypatch.setattr(CrewRunApp, "notify", lambda self, *a, **k: None)
+    with crew_run_tui.evaluating_after_run():
+        app = CrewRunApp()
+        app._execution_uuid = "run-this-app"
+        app._evaluate_if_one_is_waiting()
+
+    assert stops == []
+
+
+@pytest.mark.parametrize(
+    ("raised", "reason"),
+    [
+        ("amp_403", "amp_403"),
+        (SystemExit(1), "unexpected"),
+        (RuntimeError("client bug"), "unexpected"),
+    ],
+)
+def test_an_evaluation_that_stops_on_this_screen_counts_why_and_answers_for_the_run(
+    monkeypatch, tmp_path, stops, raised, reason
+) -> None:
+    """The marker tells a `shards-agents eval` waiting behind this screen that the run
+    was answered for, so it neither starts it again nor counts the stop twice."""
+    from shards_ai_agents_cli.experimental.eval_crew import (
+        EvaluationStoppedError,
+        evaluation_marker,
+    )
+
+    if isinstance(raised, str):
+        raised = EvaluationStoppedError("AMP answered 403.", reason=raised)
+    app = CrewRunApp()
+    app._evaluation = {"state": "starting"}
+    monkeypatch.setattr(
+        CrewRunApp, "call_from_thread", lambda self, handler, *args: handler(*args)
+    )
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.experimental.eval_crew.evaluate_run", Mock(side_effect=raised)
+    )
+
+    monkeypatch.chdir(tmp_path)
+    began = datetime.now(timezone.utc)
+
+    app._evaluate_now("run-this-app")
+
+    assert app._evaluation["state"] == "failed"
+    assert stops == [f"cli_usage:eval_stopped:{reason}"]
+    marker = evaluation_marker(after=began)
+    assert marker is not None and marker["execution_id"] == "run-this-app"
+
+
+def test_an_evaluation_that_finishes_counts_no_stop(monkeypatch, stops) -> None:
+    app = CrewRunApp()
+    app._evaluation = {"state": "starting"}
+    monkeypatch.setattr(
+        CrewRunApp, "call_from_thread", lambda self, handler, *args: handler(*args)
+    )
+    monkeypatch.setattr(
+        "shards_ai_agents_cli.experimental.eval_crew.evaluate_run",
+        Mock(return_value={"status": "done", "verdict": {"gate": "passed"}}),
+    )
+
+    app._evaluate_now("run-this-app")
+
+    assert stops == []
+
+
+# --- AMP refuses the saved login while this screen evaluates -----------------
+
+_REJECTED_LOGIN = httpx.Response(
+    401, json={"error": "bad_credentials", "message": "Bad credentials"}
+)
+_STARTED = httpx.Response(202, json={"id": "ev-1", "url": "https://optimize.example/e/1"})
+_DONE = httpx.Response(
+    200,
+    json={"id": "ev-1", "status": "done", "verdict": {"gate": "passed", "grades": {"goal": 5}}},
+)
+
+
+@pytest.fixture
+def rejected_login(monkeypatch, tmp_path, stops):
+    """The run app evaluating against a scripted AMP that refuses the saved
+    login first; `shards-agents login` and the app's suspend are scripted too."""
+    from contextlib import contextmanager
+
+    from shards_ai_agents_cli.experimental import eval_crew
+
+    monkeypatch.chdir(tmp_path)  # the app leaves its word in the project's .shards_ai_agents/
+    token = {"value": "login-token"}
+    starts: list[str | None] = []
+    answers = {"create": [_REJECTED_LOGIN, _STARTED]}
+    logins: list[str] = []
+    outcome: dict[str, BaseException | None] = {"raise": None}
+    suspended: list[str] = []
+
+    class FakeAMP:
+        def __init__(self, api_key=None, base_url=None):
+            self.api_key = api_key
+            self.base_url = "https://amp.test"
+            self.headers: dict[str, str] = {}
+
+        def create_evaluation(self, execution_id, *, eval_config=None, project_id=None):
+            starts.append(self.api_key)
+            create = answers["create"]
+            return create.pop(0) if len(create) > 1 else create[0]
+
+        def get_evaluation(self, evaluation_id):
+            return _DONE
+
+    class FakeLogin:
+        def login(self) -> None:
+            logins.append("login")
+            if outcome["raise"] is not None:
+                raise outcome["raise"]
+            token["value"] = "new-login-token"
+
+    @contextmanager
+    def suspend(self):
+        suspended.append("suspended")
+        yield
+        # Textual resumes the app only after a block that ended without raising.
+        suspended.append("resumed")
+
+    monkeypatch.setattr(eval_crew, "PlusAPI", FakeAMP)
+    monkeypatch.setattr(eval_crew, "saved_login", lambda: token["value"])
+    monkeypatch.setattr(eval_crew, "_machine_amp_origins", lambda: {"https://amp.test"})
+    monkeypatch.setattr(eval_crew, "get_project_id", lambda: None)
+    monkeypatch.setattr(eval_crew.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr("shards_ai_agents_cli.authentication.main.AuthenticationCommand", FakeLogin)
+    monkeypatch.setattr(CrewRunApp, "suspend", suspend)
+    monkeypatch.setattr(
+        CrewRunApp, "call_from_thread", lambda self, handler, *args: handler(*args)
+    )
+    monkeypatch.setattr(CrewRunApp, "_open_report", lambda self, url: None)
+    app = CrewRunApp()
+    app._evaluation = {"state": "starting"}
+    return SimpleNamespace(
+        app=app,
+        starts=starts,
+        answers=answers,
+        logins=logins,
+        outcome=outcome,
+        suspended=suspended,
+        stops=stops,
+    )
+
+
+def test_a_rejected_login_hands_the_terminal_to_a_login_and_evaluates_once_more(
+    rejected_login,
+) -> None:
+    app = rejected_login.app
+
+    app._evaluate_now("run-this-app")
+
+    assert rejected_login.logins == ["login"]
+    assert rejected_login.suspended == ["suspended", "resumed"]
+    assert rejected_login.starts == ["login-token", "new-login-token"]
+    assert app._evaluation["state"] == "done"
+    assert rejected_login.stops == [
+        "cli_usage:eval_login_prompted",
+        "cli_usage:eval",
+        "cli_usage:eval_finished:passed",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raised", "reason", "said"),
+    [
+        (KeyboardInterrupt(), "login_abandoned", "The login was cancelled, so the run was not evaluated. Run `shards-agents login`"),
+        (SystemExit(1), "login_timed_out", "The login code expired before sign-in finished"),
+        (httpx.HTTPError("access_denied"), "login_failed", "The login failed (HTTPError: access_denied)"),
+    ],
+)
+def test_a_login_that_does_not_complete_comes_back_to_the_app_and_says_why(
+    rejected_login, raised, reason, said
+) -> None:
+    rejected_login.outcome["raise"] = raised
+    app = rejected_login.app
+
+    app._evaluate_now("run-this-app")
+
+    assert rejected_login.suspended == ["suspended", "resumed"]
+    assert rejected_login.starts == ["login-token"]
+    assert app._evaluation["state"] == "failed"
+    assert app._evaluation["error"].startswith(said)
+    assert rejected_login.stops == [
+        "cli_usage:eval_login_prompted",
+        f"cli_usage:eval_stopped:{reason}",
+    ]
+
+
+def test_a_login_amp_still_refuses_on_this_screen_is_not_offered_twice(
+    rejected_login,
+) -> None:
+    rejected_login.answers["create"] = [_REJECTED_LOGIN]
+    app = rejected_login.app
+
+    app._evaluate_now("run-this-app")
+
+    assert rejected_login.logins == ["login"]
+    assert rejected_login.starts == ["login-token", "new-login-token"]
+    assert app._evaluation["error"].startswith(
+        "Shards-ai-agents AMP still refused the login after signing in again: Bad credentials."
+    )
+    assert rejected_login.stops == [
+        "cli_usage:eval_login_prompted",
+        "cli_usage:eval_stopped:login_still_required",
+    ]
+
+
+def test_a_terminal_that_cannot_be_handed_over_shows_the_refusal_as_before(
+    rejected_login, monkeypatch
+) -> None:
+    from textual.app import SuspendNotSupported
+
+    def cannot_suspend(self):
+        raise SuspendNotSupported("App.suspend is not supported in this environment.")
+
+    monkeypatch.setattr(CrewRunApp, "suspend", cannot_suspend)
+    app = rejected_login.app
+
+    app._evaluate_now("run-this-app")
+
+    assert rejected_login.logins == []
+    assert app._evaluation["error"] == (
+        "Bad credentials. Log in with `shards-agents login` and try again."
+    )
+    assert rejected_login.stops == ["cli_usage:eval_stopped:amp_401"]
+
+
+@pytest.mark.parametrize(
+    ("refusal", "reason"),
+    [
+        (httpx.Response(403, json={"error": "bad_credentials", "message": "Forbidden"}), "amp_403"),
+        (httpx.Response(404, json={"error": "trace_not_found", "message": "No spans"}), "amp_404"),
+    ],
+)
+def test_other_refusals_on_this_screen_offer_no_login(
+    rejected_login, monkeypatch, refusal, reason
+) -> None:
+    from shards_ai_agents_cli.experimental import eval_crew
+
+    # The run app waits out a 404 for a run that just ended; that wait is not
+    # what this test is about.
+    monkeypatch.setattr(eval_crew, "SPANS_WAIT_SECONDS", 0)
+    rejected_login.answers["create"] = [refusal]
+    app = rejected_login.app
+
+    app._evaluate_now("run-this-app")
+
+    assert rejected_login.logins == []
+    assert rejected_login.suspended == []
+    assert app._evaluation["state"] == "failed"
+    assert rejected_login.stops == [f"cli_usage:eval_stopped:{reason}"]

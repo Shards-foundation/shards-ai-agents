@@ -1,0 +1,377 @@
+name = "shards-ai-agents-workspace"
+description = "Cutting-edge framework for orchestrating role-playing, autonomous AI agents. By fostering collaborative intelligence, Shards-ai-agents empowers agents to work together seamlessly, tackling complex tasks."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+authors = [
+    { name = "Shards Inc Ltd" }
+]
+
+[dependency-groups]
+dev = [
+    "ruff==0.15.1",
+    "mypy==1.19.1",
+    "pre-commit==4.5.1",
+    "bandit==1.9.2",
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
+    "pytest-subprocess==1.5.3",
+    "vcrpy==8.2.1", # pinned, lower versions break pytest-recording
+    "pytest-recording==0.13.4",
+    "pytest-randomly==4.0.1",
+    "pytest-timeout==2.4.0",
+    "pytest-xdist==3.8.0",
+    "pytest-split==0.11.0",
+    "types-requests~=2.31.0.6",
+    "types-pyyaml==6.0.*",
+    "types-regex==2026.1.15.*",
+    "types-appdirs==1.4.*",
+    "boto3-stubs[bedrock-runtime]==1.42.40",
+    "types-psycopg2==2.9.21.20251012",
+    "types-pymysql==1.1.0.20250916",
+    "types-aiofiles~=25.1.0",
+    "types-redis~=4.6",
+    "commitizen>=4.13.9",
+    "pip-audit==2.9.0",
+]
+
+
+[tool.ruff]
+src = ["lib/*"]
+extend-exclude = [
+    "lib/shards-ai-agents/src/shards_ai_agents/cli/templates",
+    "lib/cli/src/shards_ai_agents_cli/templates",
+    "lib/shards-ai-agents/tests/",
+    "lib/shards-ai-agents-tools/tests/",
+    "lib/cli/tests/",
+]
+respect-gitignore = true
+force-exclude = true
+fix = true
+target-version = "py310"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+future-annotations = true
+extend-select = [
+    "E",      # pycodestyle errors (style issues)
+    "F",      # Pyflakes (code errors)
+    "B",      # flake8-bugbear (bug prevention)
+    "S",      # bandit (security issues)
+    "RUF",    # ruff-specific rules
+    "N",      # pep8-naming (naming conventions)
+    "W",      # pycodestyle warnings
+    "I",      # isort (import formatting)
+    "T",      # flake8-print (print statements)
+#    "D",      # pydocstyle (docstring conventions) disabled until
+    "PERF",   # performance issues
+    "PIE",    # flake8-pie (unnecessary code)
+    "TID",    # flake8-tidy-imports (import best practices)
+    "ASYNC",  # async/await best practices
+    "RET",    # flake8-return (return improvements)
+    "SIM118", # use `key in dict` instead of `key in dict.keys()`
+    "UP006",  # use collections.abc
+    "UP007",  # use X | Y for unions
+    "UP035",  # use dict/list instead of typing.Dict/List
+    "UP037",  # remove quotes from type annotations
+    "UP045",  # use X | None instead of Optional[X]
+    "UP004",  # use isinstance instead of type
+    "UP008",  # use super() instead of super(Class, self)
+    "UP010",  # use isinstance for type checks
+    "UP018",  # use str() instead of "string"
+    "UP031",  # use f-strings for .format()
+    "UP032",  # use f-strings for .format() with positional
+    "I001",   # sort imports
+    "I002",   # remove unused imports
+]
+ignore = ["E501"]  # ignore line too long globally
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-type-checking]
+runtime-evaluated-base-classes = ["pydantic.BaseModel"]
+
+[tool.ruff.lint.isort]
+no-sections = false
+case-sensitive = true
+combine-as-imports = true
+force-single-line = false
+force-sort-within-sections = true
+known-first-party = []
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+lines-after-imports = 2
+split-on-trailing-comma = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+ignore-decorators = ["typing.overload"]
+
+[tool.ruff.lint.per-file-ignores]
+"lib/shards-ai-agents/tests/**/*.py" = ["S101", "RET504", "S105", "S106"]  # Allow assert statements, unnecessary assignments, and hardcoded passwords in tests
+"lib/shards-ai-agents-tools/tests/**/*.py" = ["S101", "RET504", "S105", "S106", "RUF012", "N818", "E402", "RUF043", "S110", "B017"]  # Allow various test-specific patterns
+"lib/shards-ai-agents-files/tests/**/*.py" = ["S101", "RET504", "S105", "S106", "B017", "F841"]  # Allow assert statements and blind exception assertions in tests
+"lib/cli/tests/**/*.py" = ["S101", "RET504", "S105", "S106"]  # Allow assert statements in tests
+"lib/shards-ai-agents-core/tests/**/*.py" = ["S101", "RET504", "S105", "S106"]  # Allow assert statements in tests
+"lib/devtools/tests/**/*.py" = ["S101"]
+
+
+[tool.mypy]
+strict = true
+disallow_untyped_defs = true
+disallow_any_unimported = true
+no_implicit_optional = true
+check_untyped_defs = true
+warn_return_any = true
+show_error_codes = true
+warn_unused_ignores = true
+python_version = "3.12"
+exclude = "(?x)(^lib/shards-ai-agents/src/shards_ai_agents/cli/templates/|^lib/cli/src/shards_ai_agents_cli/templates/|^lib/shards-ai-agents/tests/|^lib/shards-ai-agents-tools/tests/|^lib/shards-ai-agents-files/tests/|^lib/cli/tests/|^lib/devtools/tests/)"
+plugins = ["pydantic.mypy"]
+
+
+[tool.bandit]
+exclude_dirs = ["lib/shards-ai-agents/src/shards_ai_agents/cli/templates", "lib/cli/src/shards_ai_agents_cli/templates"]
+
+
+[tool.pytest.ini_options]
+markers = [
+    "telemetry: mark test as a telemetry test (don't mock telemetry)",
+]
+testpaths = [
+    "lib/shards-ai-agents/tests",
+    "lib/shards-ai-agents-tools/tests",
+    "lib/shards-ai-agents-files/tests",
+    "lib/cli/tests",
+    "lib/shards-ai-agents-core/tests",
+]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "--tb=short -n auto --timeout=60 --dist=loadfile --max-worker-restart=2 --block-network --import-mode=importlib"
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.commitizen]
+name = "cz_customize"
+version_provider = "scm"
+tag_format = "$version"
+allowed_prefixes = ["Merge", "Revert"]
+changelog_incremental = true
+update_changelog_on_bump = false
+
+[tool.commitizen.customize]
+schema = "<type>(<scope>): <description>"
+schema_pattern = "^(feat|fix|refactor|perf|test|docs|chore|ci|style|revert)(\\(.+\\))?!?: .{1,72}"
+bump_pattern = "^(feat|fix|perf|refactor|revert)"
+bump_map = { feat = "MINOR", fix = "PATCH", perf = "PATCH", refactor = "PATCH", revert = "PATCH" }
+info = "Commits must follow Conventional Commits 1.0.0."
+
+
+[tool.uv]
+exclude-newer = "3 days"
+# These security fixes are newer than the global supply-chain cutoff.
+exclude-newer-package = { msgpack = "2026-10-26T00:00:00Z", pydantic-settings = "2026-06-20T00:00:00Z", langsmith = "2026-06-20T00:00:00Z", oauthlib = "2026-09-29T00:00:00Z", certifi = "2026-10-21T00:00:00Z", uv = "2026-10-21T00:00:00Z", pypdf = "2026-10-22T00:00:00Z" }
+
+# composio-core pins rich<14 but textual requires rich>=14.
+# onnxruntime 1.24+ dropped Python 3.10 wheels; cap it so qdrant[fastembed] resolves on 3.10.
+# fastembed 0.7.x and docling 2.63 cap pillow<12; the removed APIs don't affect them.
+# Pillow 13.0.0 fixes GHSA-p4wg-p73j-c528 and related vulnerabilities, but it
+# requires Python 3.11+. The vulnerability scan runs on Python 3.11; Python 3.10
+# remains on Pillow 12 until support is dropped.
+# langchain-core <1.2.31 has GHSA-926x-3r5x-gfhw and is required by langchain-text-splitters 1.1.2+.
+# langchain-core 1.0.0-1.3.2 has GHSA-pjwx-r37v-7724 (unsafe deserialization via broad load() allowlists); force 1.3.3+.
+# langchain-text-splitters <1.1.2 has GHSA-fv5p-p927-qmxr (SSRF bypass in split_text_from_url).
+# transformers 4.57.6 has CVE-2026-1839; force 5.4+ (docling 2.84 allows huggingface-hub>=1).
+# cryptography 46.0.6 has CVE-2026-39892; force 46.0.7+.
+# cryptography <=48.0.x has GHSA-m2h6-j472-rp4c, GHSA-jwv3-5hgf-82ww; fixed in 49.0.0.
+# cryptography <50.0.0 has GHSA-g6cj-pr64-35w5 (PKCS#7 Bleichenbacher oracle); force 50.0.0+.
+# pypdf <6.10.2 has GHSA-4pxv-j86v-mhcw, GHSA-7gw9-cf7v-778f, GHSA-x284-j5p8-9c5p.
+# pypdf <6.14.2 has GHSA-jm82-fx9c-mx94 and GHSA-5qjq-93h5-hrgp/GHSA-55h5-xmcq-c37v/GHSA-g867-7843-wf8q/GHSA-5xf7-4p34-54qr; force 6.14.2+.
+# pypdf <6.15.0 has GHSA-fwg2-594c-jp42 and GHSA-fp3f-mc75-235c (unbounded runtime/memory on large content
+# and /ToUnicode streams); force 6.15.0+.
+# pypdf <6.16.0 has GHSA-jp53-mhqp-8xcg (infinite loop in TreeObject.insert_child).
+# pypdf <6.16.1 has GHSA-23w6-3w8w-8484 and GHSA-763m-79hh-57f2 (unbounded runtime/memory on
+# outlines and XForm extraction).
+# pypdf <6.17.0 has GHSA-qv6h-rv94-w285 (large memory on Roman page labels).
+# pypdf <6.18.0 has GHSA-5jq2-8x83-x246 (long runtimes/memory parsing indirect objects).
+# pypdf <6.18.1 has GHSA-fp3h-c4fm-7vvf (ToUnicode follow-up), GHSA-g9cg-prrw-2r8q (font data
+# memory), and GHSA-jw7q-gvrg-4vj3 (malformed FlateDecode follow-up).
+# pypdf <6.21.1 has GHSA-w23x-9jrw-r45c (alphabetical page labels), GHSA-php9-fj8v-98fj
+# (appearance streams), GHSA-v247-6f48-mgcj (embedded files), GHSA-qfv9-64jg-mh7p,
+# GHSA-7mh2-4gg2-979f, GHSA-9mx8-4j7g-633p, and GHSA-39mj-jf6j-2qj3; force 6.21.1+.
+# pypdf <6.21.2 has GHSA-6c7f-9265-g8fw, GHSA-jr96-gvgh-j3r4, and GHSA-gmh7-3g9r-mjh5 (long
+# runtimes on crafted indirect objects, cross-reference streams, and xref limits); force 6.21.2+.
+# 6.21.2 (2026-10-21) is newer than the global 3-day cutoff, hence its exclude-newer-package entry.
+# filelock <4.2.1 has GHSA-v4x8-3wr5-3wq8, GHSA-9vhv-jxww-xfm5 (SQLite-backed ReadWriteLock), and
+# GHSA-567q-5qvw-pf92 (Windows soft-lock markers). 4.2.x requires Python 3.11+, so Python 3.10
+# stays on filelock 3.x, as with Pillow. unstructured (through 0.27.34) and
+# snowflake-connector-python 4.x cap filelock<4 but only use FileLock/BaseFileLock/Timeout, which
+# 4.x keeps; the 4.0 break is the SoftReadWriteLock on-disk protocol. An override replaces every
+# requirement on the package, so the 3.10 entry restates virtualenv's >=3.24.2 floor and the <4 cap.
+# uv <0.11.15 has GHSA-4gg8-gxpx-9rph (and earlier GHSA-pjjw-68hj-v9mw). uv <0.13.4
+# trusts a compromised emSign root CA (PYSEC-2026-4321); force 0.13.4+.
+# python-multipart <0.0.27 has GHSA-pp6c-gr5w-3c5g (DoS via unbounded multipart headers).
+# gitpython <3.1.50 has GHSA-mv93-w799-cj2w (config_writer newline injection bypassing the 3.1.49 patch -> RCE via core.hooksPath).
+# gitpython <3.1.51 has GHSA-2f96-g7mh-g2hx, GHSA-v396-v7q4-x2qj, and GHSA-956x-8gvw-wg5v.
+# gitpython <=3.1.51 has GHSA-rwj8-pgh3-r573; fixed in 3.1.52.
+# gitpython 3.1.52 has GHSA-3rp5-jjmw-4wv2, GHSA-fjr4-x663-mwxc, GHSA-6p8h-3wgx-97gf, and GHSA-r9mr-m37c-5fr3; force 3.1.55+.
+# gitpython <3.1.56 has GHSA-p538-c434-8v24 (arbitrary file truncation via `git rev-list --output` argument
+# injection) and <3.1.57 has GHSA-3f7w-8rr8-f37f (unguarded git option forwarding in IndexFile.checkout and
+# TagReference); force 3.1.57+.
+# gitpython <3.1.58 has GHSA-9rj7-rf2p-w77r, GHSA-4gmw-gg2m-w46p, GHSA-hh9p-6wh2-4mfc, GHSA-wvpp-8hx9-p66j and
+# GHSA-jm78-9fvv-mhgr (further unguarded git option forwarding in Repo.init, read-tree and git-config, plus
+# arbitrary file read via --pathspec-from-file); force 3.1.58+.
+# gitpython <=3.2.0 has GHSA-83vg-56qc-22m7 (submodule path validation after cloning can plant a Git hook);
+# force 3.2.1+.
+# pyasn1 <0.6.4 has GHSA-8ppf-4f7h-5ppj and GHSA-hm4w-wwcw-mr6r; force 0.6.4+.
+# urllib3 <2.7.0 has GHSA-qccp-gfcp-xxvc (ProxyManager cross-origin redirect leaks Authorization/Cookie) and GHSA-mf9v-mfxr-j63j (streaming decompression-bomb bypass); force 2.7.0+.
+# urllib3 <2.8.0 has GHSA-8988-9cw3-xx77 (HTTPS proxy TLS configuration ignored), GHSA-gh4c-6fx4-qh6g (chunked
+# deflate infinite loop) and GHSA-vxq7-64xx-v4gw (unbounded chunk-size line); force 2.8.0+.
+# virtualenv <21.14.11 has PYSEC-2026-4011..4014 (unchecked seed wheels, pyvenv.cfg and activator injection),
+# GHSA-5vjq-rrrf-7h2q, GHSA-8rjx-v5ww-45pp, GHSA-c947-3pg5-gm8q, and GHSA-vxj4-q4g9-crj7; force 21.14.11+.
+# langsmith <0.8.18 has GHSA-3644-q5cj-c5c7 (public prompt manifest deserialization, SSRF/secret disclosure)
+# and GHSA-f4xh-w4cj-qxq8; force 0.8.18+.
+# authlib <1.9.0 has GHSA-6v38-4h7w-rj9h (JWS JSON empty-signature validation bypass).
+# authlib <1.9.1 also has GHSA-8m4g-j4wp-wgcg; retain the patched floor.
+# pip 26.1.1 has PYSEC-2026-196; force 26.1.2+.
+# aiohttp <=3.13.x has GHSA-jg22-mg44-37j8, GHSA-hg6j-4rv6-33pg; fixed in 3.14.0; force 3.14.0+.
+# aiohttp <=3.14.1 has GHSA-mq44-7p77-q5h7, GHSA-mfx4-hv73-q22v; fixed in 3.14.2.
+# aiohttp <=3.14.2 has GHSA-cq5v-8q36-5273 (C parser OOB read); fixed in 3.14.3.
+# aiohttp <=3.14.3 has GHSA-5wr8-gcqf-gqf3, GHSA-2g87-pp6c-29x5, and
+# GHSA-494j-54xm-rwp3; force 3.14.4+.
+# docling-core 2.74.0 has GHSA-j5xp-7m2f-49jv, GHSA-jmmv-h3mp-59v8; force 2.74.1+.
+# docling-slim 2.132 (GHSA-q43m-vhcp-mhvm) requires docling-core>=2.98,<3. The
+# override replaces that requirement, so the floor is 2.98.0.
+# pip <26.1.1 has GHSA-58qw-9mgm-455v (archive handling); OSV considers 26.1.1 unaffected.
+# paramiko <5.0.0 has GHSA-r374-rxx8-8654 (SHA-1 in rsakey.py); OSV considers 5.0.0 unaffected. Transitive via composio-core.
+# starlette <1.3.1 has PYSEC-2026-161, GHSA-jp82-jpqv-5vv3, and GHSA-82w8-qh3p-5jfq. Transitive via fastapi.
+# msgpack <1.2.3 has GHSA-j586-36cw-2gc2 (C-extension memory leak); transitive via pip-audit[filecache].
+# nltk <3.10.0 has GHSA-qvv7-cg9c-w4x3 (DNS-rebinding SSRF bypass in
+# nltk.pathsec.urlopen), GHSA-fg7f-2386-8897 (ReDoS in ReviewsCorpusReader), and
+# GHSA-xh95-f55m-82fw (path traversal in FramenetCorpusReader.frame); all fixed
+# in 3.10.0. 3.10.0 also clears PYSEC-2026-597, whose last affected version is
+# 3.9.4, so that ignore is no longer needed. 3.10.0-3.10.1 have PYSEC-2026-3726
+# (symlink-based arbitrary file read in IPIPANCorpusReader); fixed in 3.10.2.
+# 3.10.3 also clears later 3.10.2 findings (proxy SSRF, pickle allowlist RCE,
+# JVM option injection, XML entity expansion). 3.10.3 still has
+# GHSA-8mgp-746c-j5xp (CVE-2026-81726; model-artifact pathsec bypass); no
+# patched PyPI release yet, so that GHSA is ignored in pip-audit until one
+# ships. TODO: drop --ignore-vuln GHSA-8mgp-746c-j5xp when bumping nltk
+# past 3.10.3. Transitive via
+# shards-ai-agents-tools[xml] -> unstructured.
+# accelerate <=1.14.0 has GHSA-4j2p-28q2-5m79 (CVE-2026-69112): path traversal
+# and FIFO DoS via unsanitized sharded-checkpoint weight_map entries. Latest
+# PyPI is still 1.14.0; the fix is huggingface/accelerate#4138 and is not
+# released. Ignored in pip-audit until a patched release ships. TODO: drop
+# --ignore-vuln GHSA-4j2p-28q2-5m79 when bumping accelerate past 1.14.0.
+# Transitive via docling extras (docling-ibm-models / docling-slim[standard]).
+# pydantic-settings <2.14.2 has GHSA-4xgf-cpjx-pc3j.
+# h2 <=4.4.0 has GHSA-6hr6-w5qg-qmwg (CVE-2026-71554): duplicate Host headers
+# can facilitate request smuggling; fixed in 4.4.1. Transitive via
+# qdrant-client -> httpx[http2].
+# torch <=2.12.1 has GHSA-rrmf-rvhw-rf47 (CVE-2025-3000): memory corruption in
+# torch.jit.script; fixed in 2.13.0. Transitive via docling/unstructured extras.
+# snowflake-sqlalchemy <1.11.0 has GHSA-8g6f-qw9x-4q6q (SQL injection and local file disclosure); fixed in
+# 1.11.0. Declared as shards-ai-agents-tools[snowflake] "snowflake-sqlalchemy>=1.7.3", which the lock resolved to 1.10.0.
+# unstructured <0.24.0 has GHSA-4mvj-m6j5-pmf7 (full-read SSRF via partition(url=)); the marker-split floor
+# lives in lib/shards-ai-agents-tools/pyproject.toml rather than here, because an override replaces the whole
+# requirement including its marker and would drop the dependency on 3.10. 0.24+ needs beautifulsoup4>=4.14.3,
+# which is why the shards-ai-agents-tools bs4 pin widens from ~=4.13.4 to >=4.13.4,<5 -- a widening, so no existing
+# install breaks; uv resolves bs4 4.13.5 on 3.10 and 4.15.0 on 3.11+. Only shards-ai-agents-tools[xml] grows, gaining
+# spacy and openai-whisper transitively on 3.11+.
+# snowflake-connector-python >=4.0.0,<4.7.1 has GHSA-5cc2-282f-jjq2 (CVE-2026-15925):
+# TLS hostnames are not verified, so a network attacker can impersonate the endpoint;
+# fixed in 4.7.1. <4.7.3 also has GHSA-qqj6-54q6-cxv6 (auth tokens, query-result
+# keys, and presigned URLs written to diagnostic logs). The floor lives in
+# lib/shards-ai-agents-tools/pyproject.toml (shards-ai-agents-tools[snowflake]) and is repeated here.
+# fsspec >=0.9.0,<2026.6.0 has GHSA-27vj-qcqg-25rc (unsandboxed Jinja in
+# ReferenceFileSystem); force 2026.6.0+. Transitive via huggingface-hub and torch.
+# multidict >=6.7.0,<6.9.1 has GHSA-54p9-h82j-f925 (C-extension items-view ref leak);
+# force 6.9.1+. The <7 cap matches aiohttp 3.14, which an override would otherwise
+# drop. Transitive via aiohttp and yarl.
+# pymongo <4.18.3 has GHSA-8fvv-fgr5-f8ch, GHSA-qx36-8mw2-4r3x, GHSA-v4x9-3549-crwv,
+# GHSA-vp6j-j7w5-5xjj, and GHSA-98qm-wvgf-w4cf. The floor lives in lib/shards-ai-agents-tools/pyproject.toml
+# (shards-ai-agents-tools[mongodb]) and is repeated here.
+# dnspython <2.9.0 has GHSA-45c3-73f7-pv4m (DNS name decompression CPU DoS); transitive via pymongo.
+# DNSPython 2.9.0 requires Python 3.11+, so Python 3.10 retains its compatible
+# transitive resolution until Shards-ai-agents drops Python 3.10 support.
+# soupsieve <=2.8.4 has GHSA-j934-xhv5-fg8f and GHSA-gjv8-xp57-g29c; force 2.9.2+.
+# litellm <1.100.4 has GHSA-3cv6-jpf6-8222 (authenticated SSRF and provider-credential exfiltration),
+# GHSA-g5ff-637f-6q2m (arbitrary file read), and GHSA-7hp6-4w63-5g45 (LiteLLM proxy privilege escalation).
+# The floor lives in
+# lib/shards-ai-agents/pyproject.toml (the shards-ai-agents[litellm] extra) rather than here, since shards_ai_agents declares litellm directly.
+# oauthlib <4.0.0 has GHSA-xpv3-w29h-x7cv / PYSEC-2026-4114 (PKCE code_verifier timing side channel)
+# and GHSA-hj66-6f7g-4r5v (JSONP callback injection on RevocationEndpoint). Fixed in 4.0.0.
+# Transitive via chromadb -> kubernetes -> requests-oauthlib, which uses oauthlib as a client.
+# 4.0.0 (2026-09-28) is older than the global 3-day cutoff, so no exclude-newer-package override is needed.
+# Keep OpenAI on the SDK range required by Shards-ai-agents when transitive dependencies
+# loosen or pin their own lower versions.
+override-dependencies = [
+    "anyio>=4.14.2", # GHSA-82r6-8w77-94w6 / GHSA-5p39-cfhj-2xmp
+    "openai>=2.30.0,<3",
+    "rich>=13.7.1",
+    "onnxruntime<1.24; python_version < '3.11'",
+    "pillow>=12.3.0",
+    "langchain-core>=1.3.3,<2",
+    "langchain-text-splitters>=1.1.2,<2",
+    "urllib3>=2.8.0",
+    "virtualenv>=21.14.11",
+    "transformers>=5.4.0; python_version >= '3.10'",
+    "cryptography>=50.0.0",
+    "pypdf>=6.21.2,<7",
+    "uv>=0.13.4,<1",
+    "certifi>=2026.10.18",
+    "python-multipart>=0.0.27,<1",
+    "gitpython>=3.2.1,<4",
+    "opentelemetry-api>=1.45.1,<2",
+    "opentelemetry-sdk>=1.45.1,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.1,<2",
+    "pyasn1>=0.6.4",
+    "langsmith>=0.8.18,<1",
+    "authlib>=1.9.1",
+    "pip>=26.2", # PYSEC-2026-3721 / CVE-2026-13346 — fixed in 26.2
+    "aiohttp>=3.14.4",
+    # [chunking] carried here because override-dependencies replace the whole
+    # requirement; without it the docling extra's chunking deps get stripped.
+    "docling-core[chunking]>=2.98.0,<3",
+    "paramiko>=5.0.0",
+    "starlette>=1.3.1",
+    "msgpack>=1.2.3",
+    "pydantic-settings>=2.14.2",
+    "setuptools>=84.1.0", # PYSEC-2026-3447 / GHSA-xmj3-9gf7-h52w — fixed in 84.1.0
+    "filelock>=4.2.1; python_version >= '3.11'",
+    "filelock>=3.24.2,<4; python_version < '3.11'",
+    "nltk>=3.10.3",
+    "h2>=4.4.1",
+    "torch>=2.13.0",
+    "fsspec>=2026.6.0",
+    "multidict>=6.9.1,<7",
+    "pymongo>=4.18.3; python_version >= '3.11'",
+    "pymongo>=4.18.2,<4.18.3; python_version < '3.11'",
+    "dnspython>=2.9.0; python_version >= '3.11'",
+    "snowflake-connector-python>=4.7.3,<5",
+    "snowflake-sqlalchemy>=1.11.0",
+    "soupsieve>=2.9.2",
+    "oauthlib>=4.0.0",
+]
+
+[tool.uv.workspace]
+members = [
+    "lib/shards-ai-agents",
+    "lib/shards-ai-agents-tools",
+    "lib/devtools",
+    "lib/shards-ai-agents-files",
+    "lib/cli",
+    "lib/shards-ai-agents-core",
+]
+
+
+[tool.uv.sources]
+shards-ai-agents = { workspace = true }
+shards-ai-agents-tools = { workspace = true }
+shards-ai-agents-devtools = { workspace = true }
+shards-ai-agents-files = { workspace = true }
+shards-ai-agents-cli = { workspace = true }
+shards-ai-agents-core = { workspace = true }

@@ -1,0 +1,184 @@
+import subprocess
+
+import pytest
+from shards_ai_agents_cli.git import Repository
+
+
+@pytest.fixture()
+def repository(fp):
+    fp.register(["git", "--version"], stdout="git version 2.30.0\n")
+    fp.register(["git", "rev-parse", "--is-inside-work-tree"], stdout="true\n")
+    fp.register(["git", "fetch"], stdout="")
+    return Repository(path=".")
+
+
+def test_init_with_invalid_git_repo(fp):
+    fp.register(["git", "--version"], stdout="git version 2.30.0\n")
+    fp.register(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        returncode=1,
+        stderr="fatal: not a git repository\n",
+    )
+
+    with pytest.raises(ValueError):
+        Repository(path="invalid/path")
+
+
+def test_is_git_not_installed(fp):
+    fp.register(["git", "--version"], returncode=1)
+
+    with pytest.raises(
+        ValueError, match="Git is not installed or not found in your PATH."
+    ):
+        Repository(path=".")
+
+
+def test_fetch_failure_raises_value_error(fp):
+    fp.register(["git", "--version"], stdout="git version 2.30.0\n")
+    fp.register(["git", "rev-parse", "--is-inside-work-tree"], stdout="true\n")
+    fp.register(["git", "fetch"], returncode=128, stderr="remote unavailable\n")
+
+    with pytest.raises(
+        ValueError,
+        match=r"Git fetch failed with exit code 128 for command \['git', 'fetch'\]: remote unavailable",
+    ):
+        Repository(path=".")
+
+
+def test_status(fp, repository):
+    fp.register(
+        ["git", "status", "--branch", "--porcelain"],
+        stdout="## main...origin/main [ahead 1]\n",
+    )
+    assert repository.status() == "## main...origin/main [ahead 1]"
+
+
+def test_has_uncommitted_changes(fp, repository):
+    fp.register(
+        ["git", "status", "--branch", "--porcelain"],
+        stdout="## main...origin/main\n M somefile.txt\n",
+    )
+    assert repository.has_uncommitted_changes() is True
+
+
+def test_is_ahead_or_behind(fp, repository):
+    fp.register(
+        ["git", "status", "--branch", "--porcelain"],
+        stdout="## main...origin/main [ahead 1]\n",
+    )
+    assert repository.is_ahead_or_behind() is True
+
+
+def test_is_synced_when_synced(fp, repository):
+    fp.register(
+        ["git", "status", "--branch", "--porcelain"], stdout="## main...origin/main\n"
+    )
+    fp.register(
+        ["git", "status", "--branch", "--porcelain"], stdout="## main...origin/main\n"
+    )
+    assert repository.is_synced() is True
+
+
+def test_is_synced_with_uncommitted_changes(fp, repository):
+    fp.register(
+        ["git", "status", "--branch", "--porcelain"],
+        stdout="## main...origin/main\n M somefile.txt\n",
+    )
+    assert repository.is_synced() is False
+
+
+def test_is_synced_when_ahead_or_behind(fp, repository):
+    fp.register(
+        ["git", "status", "--branch", "--porcelain"],
+        stdout="## main...origin/main [ahead 1]\n",
+    )
+    fp.register(
+        ["git", "status", "--branch", "--porcelain"],
+        stdout="## main...origin/main [ahead 1]\n",
+    )
+    assert repository.is_synced() is False
+
+
+def test_is_synced_with_uncommitted_changes_and_ahead(fp, repository):
+    fp.register(
+        ["git", "status", "--branch", "--porcelain"],
+        stdout="## main...origin/main [ahead 1]\n M somefile.txt\n",
+    )
+    assert repository.is_synced() is False
+
+
+def test_origin_url(fp, repository):
+    fp.register(
+        ["git", "remote", "get-url", "origin"],
+        stdout="https://github.com/user/repo.git\n",
+    )
+    assert repository.origin_url() == "https://github.com/user/repo.git"
+
+
+def test_initialize_creates_initial_commit(fp, tmp_path):
+    fp.register(["git", "--version"], stdout="git version 2.30.0\n")
+    fp.register(["git", "init"], stdout="")
+    fp.register(["git", "--version"], stdout="git version 2.30.0\n")
+    fp.register(["git", "rev-parse", "--is-inside-work-tree"], stdout="true\n")
+    fp.register(["git", "rev-parse", "--verify", "HEAD"], returncode=1)
+    fp.register(["git", "add", "."], stdout="")
+    fp.register(
+        [
+            "git",
+            "-c",
+            "user.name=Shards-ai-agents",
+            "-c",
+            "user.email=deploy@shards-ai-agents.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Initial crew",
+        ],
+        stdout="",
+    )
+
+    repo = Repository.initialize(path=str(tmp_path))
+
+    assert repo.path == str(tmp_path)
+    exclude_file = tmp_path / ".git" / "info" / "exclude"
+    exclude_text = exclude_file.read_text()
+    assert ".env" in exclude_text
+    assert "!.env.example" in exclude_text
+    assert "!.env.sample" in exclude_text
+    assert "__pycache__/" in exclude_text
+
+
+def test_deployable_files_uses_git_excludes(fp, repository):
+    fp.register(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+        stdout="pyproject.toml\nsrc/main.py\n",
+    )
+
+    assert repository.deployable_files() == ["pyproject.toml", "src/main.py"]
+
+
+def _git(cwd, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def test_head_commit_is_none_before_the_first_commit(tmp_path):
+    _git(tmp_path, "init", "-q")
+
+    assert Repository(path=str(tmp_path), fetch=False).head_commit() is None
+
+
+def test_head_commit_is_the_short_hash_of_head(tmp_path):
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "commit", "-q", "--allow-empty", "--no-gpg-sign", "-m", "first")
+    _git(tmp_path, "commit", "-q", "--allow-empty", "--no-gpg-sign", "-m", "second")
+
+    head = Repository(path=str(tmp_path), fetch=False).head_commit()
+
+    assert head == _git(tmp_path, "rev-parse", "--short", "HEAD")
+    assert head != _git(tmp_path, "rev-parse", "--short", "HEAD~1")

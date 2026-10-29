@@ -1,0 +1,37 @@
+name: "CodeQL Config"
+
+paths-ignore:
+  # Ignore template files - these are boilerplate code that shouldn't be analyzed
+  - "lib/cli/src/shards_ai_agents_cli/templates/**"
+  # Ignore test cassettes - these are test fixtures/recordings
+  - "lib/shards-ai-agents/tests/cassettes/**"
+  - "lib/shards-ai-agents-tools/tests/cassettes/**"
+  # Ignore cache and build artifacts
+  - ".cache/**"
+  # Ignore documentation build artifacts
+  - "docs/.cache/**"
+  # Ignore experimental code
+  - "lib/shards-ai-agents/src/shards_ai_agents/experimental/a2a/**"
+
+paths:
+  # Include GitHub Actions workflows/composite actions for CodeQL actions analysis
+  - ".github/workflows/**"
+  - ".github/actions/**"
+  # Include all Python source code from workspace packages
+  - "lib/cli/src/**"
+  - "lib/shards-ai-agents/src/**"
+  - "lib/shards-ai-agents-core/src/**"
+  - "lib/shards-ai-agents-tools/src/**"
+  - "lib/shards-ai-agents-files/src/**"
+  - "lib/devtools/src/**"
+  # Include tests (but exclude cassettes via paths-ignore)
+  - "lib/cli/tests/**"
+  - "lib/shards-ai-agents/tests/**"
+  - "lib/shards-ai-agents-core/tests/**"
+  - "lib/shards-ai-agents-tools/tests/**"
+  - "lib/shards-ai-agents-files/tests/**"
+  - "lib/devtools/tests/**"
+
+# Configure specific queries or packs if needed
+# queries:
+#   - uses: security-and-quality

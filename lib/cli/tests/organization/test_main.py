@@ -1,0 +1,304 @@
+import unittest
+from unittest.mock import MagicMock, patch, call
+
+import pytest
+from click.testing import CliRunner
+import httpx
+
+from shards_ai_agents_cli.authentication.token import AuthError
+from shards_ai_agents_cli.organization.main import OrganizationCommand
+from shards_ai_agents_cli.cli import shards_ai_agents, org_list, switch, current
+
+
+@pytest.fixture
+def runner():
+    return CliRunner()
+
+
+@pytest.fixture
+def org_command():
+    with patch.object(OrganizationCommand, "__init__", return_value=None):
+        command = OrganizationCommand()
+        yield command
+
+
+@pytest.fixture
+def mock_settings():
+    with patch("shards_ai_agents_cli.organization.main.Settings") as mock_settings_class:
+        mock_settings_instance = MagicMock()
+        mock_settings_class.return_value = mock_settings_instance
+        yield mock_settings_instance
+
+
+@patch("shards_ai_agents_cli.cli.OrganizationCommand")
+def test_org_list_command(mock_org_command_class, runner):
+    mock_org_instance = MagicMock()
+    mock_org_command_class.return_value = mock_org_instance
+
+    result = runner.invoke(org_list)
+
+    assert result.exit_code == 0
+    mock_org_command_class.assert_called_once()
+    mock_org_instance.list.assert_called_once()
+
+
+@patch("shards_ai_agents_cli.cli.OrganizationCommand")
+def test_org_switch_command(mock_org_command_class, runner):
+    mock_org_instance = MagicMock()
+    mock_org_command_class.return_value = mock_org_instance
+
+    result = runner.invoke(switch, ["test-id"])
+
+    assert result.exit_code == 0
+    mock_org_command_class.assert_called_once()
+    mock_org_instance.switch.assert_called_once_with("test-id")
+
+
+@patch("shards_ai_agents_cli.cli.OrganizationCommand")
+def test_org_current_command(mock_org_command_class, runner):
+    mock_org_instance = MagicMock()
+    mock_org_command_class.return_value = mock_org_instance
+
+    result = runner.invoke(current)
+
+    assert result.exit_code == 0
+    mock_org_command_class.assert_called_once()
+    mock_org_instance.current.assert_called_once()
+
+
+class TestOrganizationCommand(unittest.TestCase):
+    def setUp(self):
+        with patch.object(OrganizationCommand, "__init__", return_value=None):
+            self.org_command = OrganizationCommand()
+            self.org_command.plus_api_client = MagicMock()
+
+    @patch("shards_ai_agents_cli.organization.main.console")
+    @patch("shards_ai_agents_cli.organization.main.Table")
+    def test_list_organizations_success(self, mock_table, mock_console):
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = [
+            {"name": "Org 1", "uuid": "org-123"},
+            {"name": "Org 2", "uuid": "org-456"},
+        ]
+        self.org_command.plus_api_client = MagicMock()
+        self.org_command.plus_api_client.get_organizations.return_value = mock_response
+
+        mock_console.print = MagicMock()
+
+        self.org_command.list()
+
+        self.org_command.plus_api_client.get_organizations.assert_called_once()
+        mock_table.assert_called_once_with(title="Your Organizations")
+        mock_table.return_value.add_column.assert_has_calls(
+            [call("Name", style="cyan"), call("ID", style="green")]
+        )
+        mock_table.return_value.add_row.assert_has_calls(
+            [call("Org 1", "org-123"), call("Org 2", "org-456")]
+        )
+
+    @patch("shards_ai_agents_cli.organization.main.console")
+    def test_list_organizations_empty(self, mock_console):
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = []
+        self.org_command.plus_api_client = MagicMock()
+        self.org_command.plus_api_client.get_organizations.return_value = mock_response
+
+        self.org_command.list()
+
+        self.org_command.plus_api_client.get_organizations.assert_called_once()
+        mock_console.print.assert_called_once_with(
+            "You don't belong to any organizations yet.", style="yellow"
+        )
+
+    @patch("shards_ai_agents_cli.organization.main.console")
+    def test_list_organizations_api_error(self, mock_console):
+        self.org_command.plus_api_client = MagicMock()
+        self.org_command.plus_api_client.get_organizations.side_effect = (
+            httpx.HTTPError("API Error")
+        )
+
+        with pytest.raises(SystemExit):
+            self.org_command.list()
+
+        self.org_command.plus_api_client.get_organizations.assert_called_once()
+        mock_console.print.assert_called_once_with(
+            "Failed to retrieve organization list: API Error", style="bold red"
+        )
+
+    @patch("shards_ai_agents_cli.organization.main.console")
+    @patch("shards_ai_agents_cli.organization.main.Settings")
+    def test_switch_organization_success(self, mock_settings_class, mock_console):
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = [
+            {"name": "Org 1", "uuid": "org-123"},
+            {"name": "Test Org", "uuid": "test-id"},
+        ]
+        self.org_command.plus_api_client = MagicMock()
+        self.org_command.plus_api_client.get_organizations.return_value = mock_response
+
+        mock_settings_instance = MagicMock()
+        mock_settings_class.return_value = mock_settings_instance
+
+        self.org_command.switch("test-id")
+
+        self.org_command.plus_api_client.get_organizations.assert_called_once()
+        mock_settings_instance.dump.assert_called_once()
+        assert mock_settings_instance.org_name == "Test Org"
+        assert mock_settings_instance.org_uuid == "test-id"
+        mock_console.print.assert_called_once_with(
+            "Successfully switched to Test Org (test-id)", style="bold green"
+        )
+
+    @patch("shards_ai_agents_cli.organization.main.console")
+    def test_switch_organization_not_found(self, mock_console):
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = [
+            {"name": "Org 1", "uuid": "org-123"},
+            {"name": "Org 2", "uuid": "org-456"},
+        ]
+        self.org_command.plus_api_client = MagicMock()
+        self.org_command.plus_api_client.get_organizations.return_value = mock_response
+
+        with pytest.raises(SystemExit) as exc:
+            self.org_command.switch("non-existent-id")
+
+        assert exc.value.code == 1
+        self.org_command.plus_api_client.get_organizations.assert_called_once()
+        mock_console.print.assert_called_once_with(
+            "Organization with id 'non-existent-id' not found.", style="bold red"
+        )
+
+    @patch("shards_ai_agents_cli.organization.main.console")
+    @patch("shards_ai_agents_cli.organization.main.Settings")
+    def test_current_organization_with_org(self, mock_settings_class, mock_console):
+        mock_settings_instance = MagicMock()
+        mock_settings_instance.org_name = "Test Org"
+        mock_settings_instance.org_uuid = "test-id"
+        mock_settings_class.return_value = mock_settings_instance
+
+        self.org_command.current()
+
+        self.org_command.plus_api_client.get_organizations.assert_not_called()
+        mock_console.print.assert_called_once_with(
+            "Currently logged in to organization Test Org (test-id)", style="bold green"
+        )
+
+    @patch("shards_ai_agents_cli.organization.main.console")
+    @patch("shards_ai_agents_cli.organization.main.Settings")
+    def test_current_organization_without_org(self, mock_settings_class, mock_console):
+        mock_settings_instance = MagicMock()
+        mock_settings_instance.org_uuid = None
+        mock_settings_class.return_value = mock_settings_instance
+
+        with pytest.raises(SystemExit) as exc:
+            self.org_command.current()
+
+        assert exc.value.code == 1
+        assert mock_console.print.call_count == 3
+        mock_console.print.assert_any_call(
+            "You're not currently logged in to any organization.", style="yellow"
+        )
+
+    @patch("shards_ai_agents_cli.organization.main.console")
+    def test_list_organizations_unauthorized(self, mock_console):
+        mock_response = MagicMock()
+        mock_http_error = httpx.HTTPStatusError(
+            "401 Client Error: Unauthorized",
+            request=httpx.Request("GET", "http://test"),
+            response=httpx.Response(401),
+        )
+
+        mock_response.raise_for_status.side_effect = mock_http_error
+        self.org_command.plus_api_client.get_organizations.return_value = mock_response
+
+        with pytest.raises(SystemExit) as exc:
+            self.org_command.list()
+
+        assert exc.value.code == 1
+        self.org_command.plus_api_client.get_organizations.assert_called_once()
+        mock_console.print.assert_called_once_with(
+            "You are not logged in to any organization. Use 'shards-agents login' to login.",
+            style="bold red",
+        )
+
+    @patch("shards_ai_agents_cli.organization.main.console")
+    def test_switch_organization_unauthorized(self, mock_console):
+        mock_response = MagicMock()
+        mock_http_error = httpx.HTTPStatusError(
+            "401 Client Error: Unauthorized",
+            request=httpx.Request("GET", "http://test"),
+            response=httpx.Response(401),
+        )
+
+        mock_response.raise_for_status.side_effect = mock_http_error
+        self.org_command.plus_api_client.get_organizations.return_value = mock_response
+
+        with pytest.raises(SystemExit) as exc:
+            self.org_command.switch("test-id")
+
+        assert exc.value.code == 1
+        self.org_command.plus_api_client.get_organizations.assert_called_once()
+        mock_console.print.assert_called_once_with(
+            "You are not logged in to any organization. Use 'shards-agents login' to login.",
+            style="bold red",
+        )
+
+
+def _logged_out() -> str:
+    raise AuthError("No token")
+
+
+@pytest.mark.parametrize(
+    "args", [["org", "list"], ["org", "current"], ["org", "switch", "org-123"]]
+)
+def test_org_commands_exit_1_when_logged_out(runner, args):
+    with patch("shards_ai_agents_cli.command.get_auth_token", _logged_out):
+        result = runner.invoke(shards_ai_agents, args)
+
+    assert result.exit_code == 1, result.output
+    assert "Please sign up/login to Shards-ai-agents+ before using the CLI." in result.output
+    assert "Run 'shards-agents login' to sign up/login." in result.output
+
+
+def _organizations_response(orgs: list[dict[str, str]]) -> httpx.Response:
+    return httpx.Response(
+        200, json=orgs, request=httpx.Request("GET", "http://test/organizations")
+    )
+
+
+@pytest.mark.parametrize(
+    ("orgs", "expected"),
+    [
+        ([{"name": "Org 1", "uuid": "org-123"}], "org-123"),
+        ([], "You don't belong to any organizations yet."),
+    ],
+)
+def test_org_list_exits_0_when_logged_in(runner, orgs, expected):
+    with (
+        patch("shards_ai_agents_cli.command.get_auth_token", return_value="token"),
+        patch(
+            "shards_ai_agents_cli.plus_api.PlusAPI.get_organizations",
+            return_value=_organizations_response(orgs),
+        ),
+    ):
+        result = runner.invoke(shards_ai_agents, ["org", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert expected in result.output
+
+
+def test_org_current_exits_0_when_an_org_is_selected(runner):
+    with (
+        patch("shards_ai_agents_cli.command.get_auth_token", return_value="token"),
+        patch("shards_ai_agents_cli.organization.main.Settings") as settings_class,
+    ):
+        settings_class.return_value.org_name = "Org 1"
+        settings_class.return_value.org_uuid = "org-123"
+        result = runner.invoke(shards_ai_agents, ["org", "current"])
+
+    assert result.exit_code == 0, result.output
+    assert "Currently logged in to organization Org 1 (org-123)" in result.output

@@ -1,0 +1,28 @@
+import os
+
+from multion_tool import MultiOnTool  # type: ignore[import-not-found]
+from shards_ai_agents import Agent, Crew, Task
+
+
+os.environ["OPENAI_API_KEY"] = "Your Key"
+
+multion_browse_tool = MultiOnTool(api_key="Your Key")
+
+Browser = Agent(
+    role="Browser Agent",
+    goal="control web browsers using natural language ",
+    backstory="An expert browsing agent.",
+    tools=[multion_browse_tool],
+    verbose=True,
+)
+
+browse = Task(
+    description="Summarize the top 3 trending AI News headlines",
+    expected_output="A summary of the top 3 trending AI News headlines",
+    agent=Browser,
+)
+
+
+crew = Crew(agents=[Browser], tasks=[browse])
+
+crew.kickoff()
